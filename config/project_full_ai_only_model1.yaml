@@ -1,0 +1,23 @@
+paths:
+  patient_dir: "data/input/patient"
+  rules_file: "data/input/rules.xlsx"
+  output_dir: "data/output_full_ai_only_model1"
+  log_dir: "data/logs_full_ai_only_model1"
+  checkpoint_db: "data/checkpoint_full_ai_only_model1/progress.sqlite"
+
+run:
+  mode: "full"
+  concurrency: 2
+  rule_concurrency: 4
+  resume: true
+  write_xlsx: false
+  model_preflight: true
+  max_consecutive_llm_failures: 5
+
+labeling:
+  use_structured_judge: false
+  apply_missing_policy: true
+  group_rules_for_llm: true
+  llm_batch_size: 5
+  max_evidence_chars_per_section: 600
+  max_total_evidence_chars: 2200

@@ -1,0 +1,30 @@
+本地代理版使用说明
+
+1. 把这几个文件一起复制到内网电脑同一个文件夹：
+   - proxy-chat.html
+   - local_proxy.py
+   - start_proxy.bat
+
+2. 在内网电脑上双击 start_proxy.bat。
+   - 如果电脑有 Python，会优先使用 local_proxy.py。
+   - 如果没有 Python，会尝试使用 Windows PowerShell 运行 local_proxy.ps1。
+
+3. 浏览器会打开：
+   http://127.0.0.1:8765
+
+4. 页面左侧填写：
+   - 模型 API 地址，例如 http://192.168.1.100:8000/v1/chat/completions
+   - API Key，没有就留空
+   - 模型名，例如 qwen2.5
+
+5. 在右下角输入问题并发送。
+
+说明：
+- 浏览器只请求本机代理 /api/chat。
+- local_proxy.py 再去请求内网模型 API。
+- 这样通常可以避开浏览器 CORS 限制。
+- 这个版本默认兼容 OpenAI chat/completions 格式。
+- 现在也兼容常见返回格式：OpenAI/vLLM、Ollama、Claude 风格 content 数组、Gemini candidates、Cohere generations、llama.cpp completion、以及 response/text/content/generated_text 等字段。
+
+如果 start_proxy.bat 提示找不到 Python，说明内网电脑没有 Python 3。
+脚本会继续尝试 PowerShell 版本。只有 Python 和 PowerShell 都不可用时，才需要安装 Python 3 或改用其他运行环境。

@@ -1,0 +1,10 @@
+provider: "openai_compatible"
+base_url: "http://172.18.12.85:8002/v1"
+api_key: ""
+model_name: "/model"
+timeout_seconds: 180
+max_retries: 2
+concurrency: 4
+temperature: 0.0
+max_tokens: 1024
+enable_thinking: false

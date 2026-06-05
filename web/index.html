@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>数据标注沙箱</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <strong>数据标注沙箱</strong>
+      <span>AI 标注控制台</span>
+    </div>
+    <nav class="nav">
+      <button class="nav-item active" data-view="overview">运行工作台</button>
+      <button class="nav-item" data-view="patients">患者选择</button>
+      <button class="nav-item" data-view="models">模型与并发</button>
+      <button class="nav-item" data-view="checkpoint">Checkpoint</button>
+      <button class="nav-item" data-view="config">配置编辑</button>
+      <button class="nav-item" data-view="files">文件查看</button>
+    </nav>
+  </aside>
+
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1 id="pageTitle">运行工作台</h1>
+        <p id="pageSubtitle">从这里确认运行范围、启动任务、查看进度和输出。</p>
+      </div>
+      <div class="top-actions">
+        <span id="serverStatus" class="server-status">服务状态读取中...</span>
+        <button id="refreshBtn" class="primary">刷新状态</button>
+      </div>
+    </header>
+
+    <section id="view-overview" class="view active">
+      <div id="runStatusBanner" class="status-banner"></div>
+
+      <div class="two-col wide-left">
+        <div class="panel">
+          <div class="panel-title">
+            <h2>开始运行</h2>
+            <div class="panel-actions">
+              <button id="overviewStopBtn" class="danger-btn">中断运行中任务</button>
+              <button id="overviewStartBtn" class="primary">启动勾选任务</button>
+            </div>
+          </div>
+          <div id="runChecklist" class="checklist"></div>
+          <div class="subsection">
+            <h3>本次会运行的模型任务</h3>
+            <div class="mode-switch" data-mode-group>
+              <label><input type="radio" name="runModeOverview" value="single" checked> 单模型运行</label>
+              <label><input type="radio" name="runModeOverview" value="dual"> 双模型运行</label>
+            </div>
+            <div id="overviewProjectPairs" class="pair-list"></div>
+          </div>
+          <p id="overviewRunStatus" class="status"></p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">
+            <h2>运行范围</h2>
+            <button id="overviewPatientsBtn">选择患者</button>
+          </div>
+          <div id="runScope" class="scope-box"></div>
+          <div id="selectedPatientsPreview" class="mini-list"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">
+          <h2>当前进度</h2>
+          <div class="panel-actions">
+            <span id="progressUpdated"></span>
+            <button id="overviewCheckpointBtn">查看 Checkpoint</button>
+          </div>
+        </div>
+        <div id="progressList" class="progress-list"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">
+          <h2>最近处理的患者</h2>
+          <span class="muted">按更新时间倒序</span>
+        </div>
+        <div id="recentPatientsList" class="table-list"></div>
+      </div>
+
+      <div class="two-col">
+        <div class="panel">
+          <div class="panel-title"><h2>最近输出</h2></div>
+          <div id="runsList" class="list"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-title"><h2>启动记录</h2></div>
+          <div id="dashboardRunsOverview" class="list"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-patients" class="view">
+      <div class="panel">
+        <div class="panel-title">
+          <h2>患者文件选择</h2>
+          <button id="savePatientsBtn" class="primary">保存选择</button>
+        </div>
+        <div class="toolbar">
+          <label class="check"><input type="checkbox" id="enablePatientSelection"> 只运行勾选患者</label>
+          <button id="selectAllPatientsBtn">全选</button>
+          <button id="clearPatientsBtn">清空</button>
+          <input id="patientSearch" type="search" placeholder="搜索患者文件">
+        </div>
+        <div class="pathbar"><span>患者目录</span><code id="patientDir">-</code></div>
+        <p id="patientSelectionSummary" class="status">-</p>
+        <div id="patientList" class="patient-list"></div>
+        <p id="patientStatus" class="status"></p>
+      </div>
+    </section>
+
+    <section id="view-models" class="view">
+      <div class="panel">
+        <div class="panel-title">
+          <h2>模型任务</h2>
+          <div class="panel-actions">
+            <button id="stopRunsBtn" class="danger-btn">中断运行中任务</button>
+            <button id="startBothBtn" class="primary">启动勾选任务</button>
+          </div>
+        </div>
+        <p class="status">每个模型使用独立项目配置，避免输出、日志和 checkpoint 互相覆盖。</p>
+        <div class="mode-switch" data-mode-group>
+          <label><input type="radio" name="runModeModels" value="single" checked> 单模型运行</label>
+          <label><input type="radio" name="runModeModels" value="dual"> 双模型运行</label>
+        </div>
+        <div id="projectPairs" class="pair-list"></div>
+        <p id="multiStatus" class="status"></p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">
+          <h2>并发与压测</h2>
+          <button id="saveConcurrencyBtn">保存正式并发数</button>
+        </div>
+        <div class="form-grid">
+          <label>患者并发数<input id="runConcurrency" type="number" min="1" max="64" step="1"></label>
+          <label>单患者规则并发数<input id="ruleConcurrency" type="number" min="1" max="64" step="1"></label>
+          <label>批量规则数<input id="llmBatchSize" type="number" min="1" max="50" step="1"></label>
+          <label>连续失败熔断阈值<input id="maxFailures" type="number" min="0" max="100" step="1"></label>
+          <label>模型输出上限 max_tokens<input id="maxTokens" type="number" min="128" max="4096" step="128"></label>
+          <label class="check field-check"><input id="groupRulesForLlm" type="checkbox"> 多条规则合并一次 AI 调用</label>
+          <label class="check field-check"><input id="writeXlsx" type="checkbox"> 每次结束导出 XLSX</label>
+          <label>压测并发数<input id="benchConcurrency" type="number" min="1" max="64" step="1" value="2"></label>
+          <label>压测请求数<input id="benchRequests" type="number" min="1" max="200" step="1" value="4"></label>
+          <label>
+            压测类型
+            <select id="benchPromptMode">
+              <option value="short">短提示词</option>
+              <option value="realish">接近真实标注</option>
+            </select>
+          </label>
+          <label>
+            压测模型
+            <select id="benchModelSelect"></select>
+          </label>
+        </div>
+        <div class="toolbar">
+          <button id="runBenchmarkBtn" class="primary">开始压测</button>
+          <span id="concurrencyStatus" class="status inline"></span>
+        </div>
+        <div id="benchmarkSummary" class="stats-grid compact"></div>
+        <pre id="benchmarkOutput" class="output"></pre>
+      </div>
+    </section>
+
+    <section id="view-checkpoint" class="view">
+      <div class="panel">
+        <div class="panel-title">
+          <h2>Checkpoint 状态</h2>
+          <span id="checkpointUpdated"></span>
+        </div>
+        <div id="checkpointList" class="checkpoint-list"></div>
+      </div>
+    </section>
+
+    <section id="view-config" class="view">
+      <div class="panel">
+        <div class="panel-title">
+          <h2>配置编辑</h2>
+          <button id="saveConfigBtn" class="primary">保存配置</button>
+        </div>
+        <div class="toolbar">
+          <select id="configSelect"></select>
+          <button id="reloadConfigBtn">重新载入</button>
+        </div>
+        <textarea id="configEditor" spellcheck="false"></textarea>
+        <p id="configStatus" class="status"></p>
+      </div>
+    </section>
+
+    <section id="view-files" class="view">
+      <div class="panel">
+        <div class="panel-title">
+          <h2>文件查看</h2>
+          <button id="upBtn">上级</button>
+        </div>
+        <div class="pathbar"><span>当前路径</span><code id="currentPath">.</code></div>
+        <div class="file-layout">
+          <div id="fileList" class="file-list"></div>
+          <div class="viewer">
+            <div class="viewer-head">
+              <span id="viewerTitle">选择文件</span>
+              <a id="downloadLink" href="#" target="_blank">下载</a>
+            </div>
+            <pre id="filePreview"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

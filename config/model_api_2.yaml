@@ -1,0 +1,9 @@
+provider: "openai_compatible"
+base_url: "http://SERVER_C_IP:8002/v1"
+api_key: "REPLACE_WITH_API_KEY"
+model_name: "model_2"
+timeout_seconds: 180
+max_retries: 2
+concurrency: 4
+temperature: 0.0
+max_tokens: 1024

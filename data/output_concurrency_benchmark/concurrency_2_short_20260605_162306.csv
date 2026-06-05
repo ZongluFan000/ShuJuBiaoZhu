@@ -1,0 +1,5 @@
+﻿request_id,status,latency_seconds,error,response_preview
+1,success,0.7653,,"{""label"": ""符合"", ""explanation"": ""并发测试"", ""evidence"": ""测试"", ""confidence"": 0.9}"
+2,success,0.7638,,"{""label"": ""符合"", ""explanation"": ""并发测试"", ""evidence"": ""测试"", ""confidence"": 0.9}"
+3,success,0.6143,,"{""label"": ""符合"", ""explanation"": ""并发测试"", ""evidence"": ""测试"", ""confidence"": 0.9}"
+4,success,0.6142,,"{""label"": ""符合"", ""explanation"": ""并发测试"", ""evidence"": ""测试"", ""confidence"": 0.9}"

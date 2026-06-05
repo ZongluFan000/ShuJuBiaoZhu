@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>本地代理大模型聊天</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --soft: #edf3f8;
+      --text: #182230;
+      --muted: #667085;
+      --line: #d7dee8;
+      --accent: #216e9f;
+      --accent-strong: #165b86;
+      --danger: #b42318;
+      --user: #dff0ff;
+      --shadow: 0 16px 42px rgba(24, 34, 48, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Microsoft YaHei", "PingFang SC", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    button,
+    input,
+    textarea {
+      font: inherit;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 340px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    aside {
+      padding: 22px;
+      background: var(--panel);
+      border-right: 1px solid var(--line);
+      overflow: auto;
+    }
+
+    main {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 20px;
+    }
+
+    .sub {
+      margin: 0 0 22px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .field {
+      display: grid;
+      gap: 7px;
+      margin-bottom: 14px;
+    }
+
+    label {
+      color: #344054;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 11px;
+      outline: none;
+      background: #fff;
+      color: var(--text);
+    }
+
+    textarea {
+      min-height: 88px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    input:focus,
+    textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(33, 110, 159, 0.14);
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 12px;
+      cursor: pointer;
+      color: #fff;
+      background: var(--accent);
+    }
+
+    button:hover {
+      background: var(--accent-strong);
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    button.secondary {
+      color: var(--text);
+      background: var(--soft);
+    }
+
+    .top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.86);
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 13px;
+      text-align: right;
+    }
+
+    .status.error {
+      color: var(--danger);
+    }
+
+    .chat {
+      overflow: auto;
+      padding: 24px;
+    }
+
+    .empty {
+      max-width: 720px;
+      margin: 8vh auto 0;
+      padding: 26px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      line-height: 1.65;
+    }
+
+    .empty strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 22px;
+    }
+
+    .msg {
+      max-width: 900px;
+      margin: 0 auto 16px;
+    }
+
+    .role {
+      margin-bottom: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .bubble {
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.65;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px 16px;
+      background: var(--panel);
+    }
+
+    .msg.user .bubble {
+      background: var(--user);
+      border-color: #b7ddf4;
+    }
+
+    .msg.error .bubble {
+      color: var(--danger);
+    }
+
+    .composer {
+      padding: 16px 24px 22px;
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .composer-inner {
+      max-width: 980px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 96px;
+      gap: 12px;
+      align-items: end;
+    }
+
+    .composer textarea {
+      min-height: 58px;
+      max-height: 180px;
+    }
+
+    .send {
+      height: 58px;
+    }
+
+    code {
+      color: #475467;
+    }
+
+    @media (max-width: 860px) {
+      .app {
+        grid-template-columns: 1fr;
+      }
+
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .composer-inner {
+        grid-template-columns: 1fr;
+      }
+
+      .send {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <h1>本地代理聊天</h1>
+      <p class="sub">浏览器只连接本机代理，代理再访问内网模型接口，用来避开浏览器 CORS 限制。</p>
+
+      <div class="field">
+        <label for="apiUrl">模型 API 地址</label>
+        <input id="apiUrl" placeholder="http://192.168.1.100:8000/v1/chat/completions" />
+      </div>
+
+      <div class="field">
+        <label for="apiKey">API Key</label>
+        <input id="apiKey" type="password" placeholder="没有就留空" autocomplete="off" />
+      </div>
+
+      <div class="field">
+        <label for="model">模型名</label>
+        <input id="model" placeholder="qwen2.5" />
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="temperature">温度</label>
+          <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7" />
+        </div>
+        <div class="field">
+          <label for="maxTokens">最大输出</label>
+          <input id="maxTokens" type="number" min="1" step="1" value="2048" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="systemPrompt">系统提示词</label>
+        <textarea id="systemPrompt">你是一个有帮助的中文助手，回答清晰、准确、简洁。</textarea>
+      </div>
+
+      <div class="buttons">
+        <button id="save">保存配置</button>
+        <button id="clear" class="secondary">清空对话</button>
+      </div>
+
+      <p class="sub" style="margin-top: 18px;">
+        启动后访问 <code>http://127.0.0.1:8765</code>。如果模型接口不是 OpenAI 格式，需要改代理脚本里的请求体和返回解析。
+      </p>
+    </aside>
+
+    <main>
+      <header class="top">
+        <strong>聊天</strong>
+        <span id="status" class="status">本地代理页面已打开</span>
+      </header>
+
+      <section id="chat" class="chat">
+        <div class="empty" id="empty">
+          <strong>先启动代理，再开始对话</strong>
+          在左侧填写模型 API 地址和模型名。发送消息时，页面会请求本机 <code>/api/chat</code>，由代理服务转发到内网模型。
+        </div>
+      </section>
+
+      <footer class="composer">
+        <div class="composer-inner">
+          <textarea id="prompt" placeholder="输入消息，Ctrl + Enter 发送"></textarea>
+          <button id="send" class="send">发送</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    const settingsKey = "proxy-llm-chat-settings";
+    const historyKey = "proxy-llm-chat-history";
+    const messages = loadJson(historyKey, []);
+
+    const el = {
+      apiUrl: document.querySelector("#apiUrl"),
+      apiKey: document.querySelector("#apiKey"),
+      model: document.querySelector("#model"),
+      temperature: document.querySelector("#temperature"),
+      maxTokens: document.querySelector("#maxTokens"),
+      systemPrompt: document.querySelector("#systemPrompt"),
+      save: document.querySelector("#save"),
+      clear: document.querySelector("#clear"),
+      chat: document.querySelector("#chat"),
+      empty: document.querySelector("#empty"),
+      status: document.querySelector("#status"),
+      prompt: document.querySelector("#prompt"),
+      send: document.querySelector("#send")
+    };
+
+    restoreSettings();
+    render();
+
+    el.save.addEventListener("click", () => {
+      saveSettings();
+      status("配置已保存");
+    });
+
+    el.clear.addEventListener("click", () => {
+      messages.length = 0;
+      localStorage.removeItem(historyKey);
+      render();
+      status("对话已清空");
+    });
+
+    el.send.addEventListener("click", send);
+    el.prompt.addEventListener("keydown", (event) => {
+      if (event.ctrlKey && event.key === "Enter") {
+        send();
+      }
+    });
+
+    function loadJson(key, fallback) {
+      try {
+        return JSON.parse(localStorage.getItem(key)) ?? fallback;
+      } catch {
+        return fallback;
+      }
+    }
+
+    function restoreSettings() {
+      const saved = loadJson(settingsKey, {});
+      el.apiUrl.value = saved.apiUrl || "";
+      el.apiKey.value = saved.apiKey || "";
+      el.model.value = saved.model || "";
+      el.temperature.value = saved.temperature || "0.7";
+      el.maxTokens.value = saved.maxTokens || "2048";
+      el.systemPrompt.value = saved.systemPrompt || el.systemPrompt.value;
+    }
+
+    function getSettings() {
+      return {
+        apiUrl: el.apiUrl.value.trim(),
+        apiKey: el.apiKey.value.trim(),
+        model: el.model.value.trim(),
+        temperature: Number(el.temperature.value || 0.7),
+        maxTokens: Number(el.maxTokens.value || 2048),
+        systemPrompt: el.systemPrompt.value.trim()
+      };
+    }
+
+    function saveSettings() {
+      localStorage.setItem(settingsKey, JSON.stringify(getSettings()));
+    }
+
+    async function send() {
+      const content = el.prompt.value.trim();
+      const settings = getSettings();
+
+      if (!settings.apiUrl) {
+        status("请填写模型 API 地址", true);
+        el.apiUrl.focus();
+        return;
+      }
+
+      if (!settings.model) {
+        status("请填写模型名", true);
+        el.model.focus();
+        return;
+      }
+
+      if (!content) {
+        el.prompt.focus();
+        return;
+      }
+
+      saveSettings();
+      messages.push({ role: "user", content });
+      el.prompt.value = "";
+      render();
+      busy(true);
+
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...settings,
+            messages: messages.filter((message) => !message.error)
+          })
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || `HTTP ${response.status}`);
+        }
+
+        messages.push({ role: "assistant", content: buildAssistantDisplay(data) });
+        localStorage.setItem(historyKey, JSON.stringify(messages));
+        render();
+        status("已完成");
+      } catch (error) {
+        messages.push({ role: "assistant", content: `请求失败：${error.message}`, error: true });
+        render();
+        status("请求失败", true);
+      } finally {
+        busy(false);
+      }
+    }
+
+    function render() {
+      el.chat.innerHTML = "";
+      if (!messages.length) {
+        el.chat.appendChild(el.empty);
+        return;
+      }
+
+      for (const message of messages) {
+        const item = document.createElement("article");
+        item.className = `msg ${message.role}${message.error ? " error" : ""}`;
+        const role = document.createElement("div");
+        role.className = "role";
+        role.textContent = message.role === "user" ? "你" : "助手";
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.textContent = message.content;
+        item.append(role, bubble);
+        el.chat.appendChild(item);
+      }
+
+      el.chat.scrollTop = el.chat.scrollHeight;
+    }
+
+    function buildAssistantDisplay(data) {
+      if (data.content) {
+        return data.content;
+      }
+
+      const rawText = formatRaw(data.raw);
+      if (rawText) {
+        return `接口返回成功，但没有识别到回复内容。\n\n原始返回：\n${rawText}`;
+      }
+
+      return "接口返回成功，但没有识别到回复内容，也没有收到可显示的原始返回。";
+    }
+
+    function formatRaw(raw) {
+      if (raw === undefined || raw === null) {
+        return "";
+      }
+
+      const text = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
+      return text.length > 2500 ? `${text.slice(0, 2500)}\n...` : text;
+    }
+
+    function busy(isBusy) {
+      el.send.disabled = isBusy;
+      el.send.textContent = isBusy ? "发送中" : "发送";
+      if (isBusy) {
+        status("本地代理正在请求模型");
+      }
+    }
+
+    function status(text, isError = false) {
+      el.status.textContent = text;
+      el.status.classList.toggle("error", isError);
+    }
+  </script>
+</body>
+</html>

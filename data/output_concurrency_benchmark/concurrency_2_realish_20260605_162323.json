@@ -1,0 +1,17 @@
+{
+  "run_id": "20260605_162323",
+  "provider": "openai_compatible",
+  "model_name": "/model",
+  "base_url": "http://172.18.12.85:8002/v1",
+  "prompt_mode": "realish",
+  "concurrency": 2,
+  "requests": 4,
+  "success": 4,
+  "failed": 0,
+  "failure_rate": 0.0,
+  "total_elapsed_seconds": 3.263,
+  "requests_per_minute": 73.543,
+  "avg_latency_seconds": 1.631,
+  "p50_latency_seconds": 1.631,
+  "p95_latency_seconds": 1.804
+}
