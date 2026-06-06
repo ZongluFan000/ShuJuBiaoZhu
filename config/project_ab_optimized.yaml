@@ -1,22 +1,22 @@
 paths:
   patient_dir: "data/input/patient"
   rules_file: "data/input/rules.xlsx"
-  output_dir: "data/output_full_ai_only"
-  log_dir: "data/logs_full_ai_only"
-  checkpoint_db: "data/checkpoint_full_ai_only/progress.sqlite"
+  output_dir: "data/ab_experiment/optimized"
+  log_dir: "data/ab_experiment/optimized_logs"
+  checkpoint_db: "data/ab_experiment/optimized_checkpoint/progress.sqlite"
 
 run:
   mode: "full"
-  concurrency: 2
+  concurrency: 1
   rule_concurrency: 4
-  resume: true
+  resume: false
   write_xlsx: false
   model_preflight: true
   max_consecutive_llm_failures: 5
 
 labeling:
   use_structured_judge: false
-  apply_missing_policy: false
+  apply_missing_policy: true
   group_rules_for_llm: true
   use_compact_prompt: true
   llm_batch_size: 10
@@ -25,8 +25,8 @@ labeling:
 
 optimization:
   enabled: true
-  merge_exact_duplicates: false
-  use_reviewed_equivalent_groups: false
+  merge_exact_duplicates: true
+  use_reviewed_equivalent_groups: true
   reviewed_groups_file: "config/reviewed_equivalent_rules.json"
   max_batch_rules: 10
   max_simple_batch_rules: 10

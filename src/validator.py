@@ -79,6 +79,39 @@ def normalize_llm_batch_result(data: dict[str, Any], rules: list[TrialRule]) -> 
     return normalized
 
 
+def normalize_llm_batch_result_strict(data: dict[str, Any], rules: list[TrialRule]) -> list[dict[str, Any]]:
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list):
+        raise ValueError("批量模型输出缺少 items 数组")
+    if len(raw_items) != len(rules):
+        raise ValueError(f"批量模型输出数量不一致：expected={len(rules)} actual={len(raw_items)}")
+
+    item_map: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            raise ValueError("批量模型输出包含非对象元素")
+        key = (
+            str(item.get("trial_id") or "").strip(),
+            str(item.get("standard_no") or "").strip(),
+        )
+        if not all(key):
+            raise ValueError("批量模型输出缺少 trial_id 或 standard_no")
+        if key in item_map:
+            raise ValueError(f"批量模型输出包含重复规则：{key[0]}/{key[1]}")
+        label = str(item.get("label") or "").strip()
+        if label not in ALLOWED_LABELS:
+            raise ValueError(f"Invalid batch label: {key[0]}/{key[1]} label={label!r}")
+        item_map[key] = item
+
+    expected = {(rule.trial_id, rule.standard_no) for rule in rules}
+    actual = set(item_map)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(f"批量模型规则ID不匹配：missing={missing[:5]} extra={extra[:5]}")
+    return [normalize_llm_item(item_map[(rule.trial_id, rule.standard_no)], rule) for rule in rules]
+
+
 def apply_missing_policy(result: dict[str, Any], rule: TrialRule, profile: RuleProfile) -> dict[str, Any]:
     text = f"{result.get('explanation', '')} {result.get('evidence', '')}"
     if not any(keyword in text for keyword in MISSING_KEYWORDS):
