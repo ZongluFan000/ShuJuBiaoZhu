@@ -16,8 +16,23 @@ run:
 
 labeling:
   use_structured_judge: false
-  apply_missing_policy: true
+  apply_missing_policy: false
   group_rules_for_llm: true
-  llm_batch_size: 5
+  use_compact_prompt: true
+  llm_batch_size: 10
   max_evidence_chars_per_section: 600
   max_total_evidence_chars: 2200
+
+optimization:
+  enabled: true
+  merge_exact_duplicates: false
+  use_reviewed_equivalent_groups: false
+  reviewed_groups_file: "config/reviewed_equivalent_rules.json"
+  max_batch_rules: 10
+  max_simple_batch_rules: 10
+  max_normal_batch_rules: 9
+  max_complex_batch_rules: 3
+  batch_complexity_budget: 32
+  max_batch_rule_chars: 3000
+  estimated_output_tokens_per_rule: 90
+  output_token_reserve: 128
