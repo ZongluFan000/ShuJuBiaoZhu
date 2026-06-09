@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import mimetypes
 import os
@@ -629,7 +630,8 @@ def clear_checkpoints(payload: dict) -> dict:
     confirm = str(payload.get("confirm") or "").strip()
     if confirm != "CLEAR":
         raise ValueError("confirmation mismatch")
-    active_runs = [run for run in list_dashboard_runs().get("runs", []) if run.get("active")]
+    active_pids = active_pid_set()
+    active_runs = [run for run in load_run_records() if run_is_active(run, active_pids)]
     if active_runs:
         names = ", ".join(str(run.get("project_config") or run.get("pid")) for run in active_runs)
         raise ValueError(f"cannot clear checkpoints while tasks are running: {names}")
@@ -761,7 +763,7 @@ def project_progress(project_config: str) -> dict:
     percent = round(processed / total_tasks * 100, 2) if total_tasks else 0
     summary_path = output_dir / "run_summary.json"
     has_summary = summary_path.exists()
-    active = any(run_is_active(run) and run.get("project_config") == project_config for run in list_dashboard_runs().get("runs", []))
+    active = any(run.get("active") and run.get("project_config") == project_config for run in list_dashboard_runs().get("runs", []))
     state = "not_started"
     if total_tasks and processed >= total_tasks:
         state = "complete" if failed == 0 else "complete_with_failures"
@@ -793,13 +795,39 @@ def project_progress(project_config: str) -> dict:
     }
 
 
-def run_is_active(run: dict) -> bool:
+def active_pid_set() -> set[int]:
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return set()
+        pids: set[int] = set()
+        for row in csv.reader(proc.stdout.splitlines()):
+            if len(row) >= 2:
+                try:
+                    pids.add(int(row[1]))
+                except ValueError:
+                    continue
+        return pids
+    except Exception:
+        return set()
+
+
+def run_is_active(run: dict, active_pids: set[int] | None = None) -> bool:
     try:
         pid = int(run.get("pid") or 0)
     except Exception:
         return False
     if pid <= 0:
         return False
+    if active_pids is not None:
+        return pid in active_pids
     try:
         proc = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV"], capture_output=True, text=True, timeout=5)
         return str(pid) in proc.stdout
@@ -827,7 +855,7 @@ def start_dashboard_runs(payload: dict) -> dict:
     existing_runs = list_dashboard_runs().get("runs", [])
     skipped = []
     for name, project_config, model_config in normalized:
-        active = next((run for run in existing_runs if run_is_active(run) and run.get("project_config") == project_config), None)
+        active = next((run for run in existing_runs if run.get("active") and run.get("project_config") == project_config), None)
         if active:
             skipped.append({
                 "name": name,
@@ -954,6 +982,7 @@ def stop_dashboard_runs(payload: dict) -> dict:
     project_config = str(payload.get("project_config") or "")
     pid = int(payload.get("pid") or 0)
     rows = load_run_records()
+    active_pids = active_pid_set()
     stopped = []
     skipped = []
     for run in rows:
@@ -964,7 +993,7 @@ def stop_dashboard_runs(payload: dict) -> dict:
             continue
         if project_config and run.get("project_config") != project_config:
             continue
-        if mode == "active" and not run_is_active(run):
+        if mode == "active" and not run_is_active(run, active_pids):
             continue
         result = stop_one_run(run)
         if result.get("ok"):
@@ -1087,13 +1116,14 @@ def save_run_records(rows: list[dict]) -> None:
 
 
 def list_dashboard_runs() -> dict:
-    rows = load_run_records()
+    rows = load_run_records()[:20]
+    active_pids = active_pid_set()
     for row in rows:
         log_path = ROOT / str(row.get("log") or "")
         if log_path.exists():
             row["log_updated_at"] = datetime.fromtimestamp(log_path.stat().st_mtime).isoformat(timespec="seconds")
-        row["active"] = run_is_active(row)
-    return {"runs": rows[:20]}
+        row["active"] = run_is_active(row, active_pids)
+    return {"runs": rows}
 
 
 def update_yaml_scalar(path: Path, key_path: list[str], value: int | str | bool) -> None:

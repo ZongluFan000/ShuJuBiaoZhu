@@ -6,6 +6,7 @@ config/model_internal_health.yaml
 
 # Patient data and local selections should not be committed.
 data/input/patient/
+data/input/patient*/
 data/input/patient100/
 data/selected_patients.json
 

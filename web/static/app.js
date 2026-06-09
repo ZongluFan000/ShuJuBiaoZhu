@@ -217,6 +217,15 @@ function renderWorkbench() {
   renderRecentPatients();
 }
 
+function scheduleWorkbenchRender() {
+  if (state.workbenchRenderPending) return;
+  state.workbenchRenderPending = true;
+  requestAnimationFrame(() => {
+    state.workbenchRenderPending = false;
+    renderWorkbench();
+  });
+}
+
 function checklistItem(label, ok, text) {
   return `
     <div class="checklist-item ${ok ? "ok" : "danger"}">
@@ -381,11 +390,25 @@ function selectedPatientNames() {
   return state.patients.filter(item => item.selected).map(item => item.name);
 }
 
+function selectedPatientCount() {
+  return state.patients.reduce((count, item) => count + (item.selected ? 1 : 0), 0);
+}
+
+function updatePatientSelectionSummary() {
+  $("patientSelectionSummary").textContent = `共 ${state.patients.length} 个患者文件，已选择 ${selectedPatientCount()} 个。`;
+}
+
+function syncVisiblePatientCheckboxes() {
+  const selected = new Set(selectedPatientNames());
+  document.querySelectorAll("#patientList input[data-patient]").forEach(input => {
+    input.checked = selected.has(input.dataset.patient);
+  });
+}
+
 function renderPatients() {
   const keyword = ($("patientSearch").value || "").trim().toLowerCase();
   const visible = state.patients.filter(item => !keyword || item.name.toLowerCase().includes(keyword));
-  const selected = selectedPatientNames().length;
-  $("patientSelectionSummary").textContent = `共 ${state.patients.length} 个患者文件，已选择 ${selected} 个。`;
+  updatePatientSelectionSummary();
   $("patientList").innerHTML = visible.map(item => `
     <label class="patient-row">
       <input type="checkbox" data-patient="${escapeHtml(item.name)}" ${item.selected ? "checked" : ""}>
@@ -393,6 +416,16 @@ function renderPatients() {
       <small>${humanSize(item.size)}</small>
     </label>
   `).join("") || "<p class='status'>未找到患者文件。</p>";
+}
+
+function schedulePatientRender() {
+  if (state.patientRenderTimer) {
+    clearTimeout(state.patientRenderTimer);
+  }
+  state.patientRenderTimer = setTimeout(() => {
+    state.patientRenderTimer = null;
+    renderPatients();
+  }, 120);
 }
 
 function markPatientDirty() {
@@ -590,7 +623,8 @@ async function clearCheckpoints() {
       body: JSON.stringify({confirm: "CLEAR"})
     });
     $("checkpointActionStatus").textContent = `已清除 ${data.deleted.length} 个 Checkpoint 文件。下次启动会从头运行，不会跳过旧患者。`;
-    await Promise.all([loadProjects(), loadProgress(), loadStats(), loadCheckpoints()]);
+    await Promise.all([loadProjects(), loadProgress(), loadCheckpoints()]);
+    renderWorkbench();
   } finally {
     $("clearCheckpointsBtn").disabled = false;
   }
@@ -782,29 +816,31 @@ function bind() {
   $("selectAllPatientsBtn").addEventListener("click", () => {
     state.patients.forEach(item => { item.selected = true; });
     $("enablePatientSelection").checked = true;
-    renderPatients();
-    renderWorkbench();
+    syncVisiblePatientCheckboxes();
+    updatePatientSelectionSummary();
+    scheduleWorkbenchRender();
     markPatientDirty();
   });
   $("clearPatientsBtn").addEventListener("click", () => {
     state.patients.forEach(item => { item.selected = false; });
-    renderPatients();
-    renderWorkbench();
+    syncVisiblePatientCheckboxes();
+    updatePatientSelectionSummary();
+    scheduleWorkbenchRender();
     markPatientDirty();
   });
-  $("patientSearch").addEventListener("input", renderPatients);
+  $("patientSearch").addEventListener("input", schedulePatientRender);
   $("patientList").addEventListener("change", event => {
     const input = event.target.closest("input[data-patient]");
     if (!input) return;
     const item = state.patients.find(row => row.name === input.dataset.patient);
     if (item) item.selected = input.checked;
     if (input.checked) $("enablePatientSelection").checked = true;
-    renderPatients();
-    renderWorkbench();
+    updatePatientSelectionSummary();
+    scheduleWorkbenchRender();
     markPatientDirty();
   });
   $("enablePatientSelection").addEventListener("change", () => {
-    renderWorkbench();
+    scheduleWorkbenchRender();
     markPatientDirty();
   });
   $("upBtn").addEventListener("click", goUp);
