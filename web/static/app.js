@@ -569,6 +569,33 @@ async function stopRuns(payload = {}) {
   await Promise.all([loadProjects(), loadProgress(), loadStats(), loadCheckpoints()]);
 }
 
+async function clearCheckpoints() {
+  if (activeRuns().length) {
+    $("checkpointActionStatus").textContent = "当前仍有任务运行，请先中断任务，再清除 Checkpoint。";
+    return;
+  }
+  const firstConfirm = confirm("确认清除所有 Checkpoint 吗？清除后，已跑过的患者和规则会从头重新执行；历史输出文件不会删除。");
+  if (!firstConfirm) return;
+  const typed = prompt("为了防止误触，请输入 CLEAR 后再确认清除：");
+  if (typed !== "CLEAR") {
+    $("checkpointActionStatus").textContent = "已取消：确认词不匹配。";
+    return;
+  }
+  $("clearCheckpointsBtn").disabled = true;
+  $("checkpointActionStatus").textContent = "正在清除 Checkpoint...";
+  try {
+    const data = await api("/api/clear-checkpoints", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({confirm: "CLEAR"})
+    });
+    $("checkpointActionStatus").textContent = `已清除 ${data.deleted.length} 个 Checkpoint 文件。下次启动会从头运行，不会跳过旧患者。`;
+    await Promise.all([loadProjects(), loadProgress(), loadStats(), loadCheckpoints()]);
+  } finally {
+    $("clearCheckpointsBtn").disabled = false;
+  }
+}
+
 function renderDashboardRuns(runs) {
   const html = runs.map(run => `
     <div class="run-item">
@@ -731,6 +758,7 @@ function bind() {
   $("runBenchmarkBtn").addEventListener("click", runBenchmark);
   $("startBothBtn").addEventListener("click", () => startRuns("projectPairs"));
   $("stopRunsBtn").addEventListener("click", () => stopRuns());
+  $("clearCheckpointsBtn").addEventListener("click", clearCheckpoints);
 
   for (const containerId of ["projectPairs", "overviewProjectPairs"]) {
     $(containerId).addEventListener("click", event => {

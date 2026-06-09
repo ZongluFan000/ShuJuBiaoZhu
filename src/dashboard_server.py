@@ -132,6 +132,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/stop":
                 self._json(stop_dashboard_runs(payload))
                 return
+            if parsed.path == "/api/clear-checkpoints":
+                self._json(clear_checkpoints(payload))
+                return
             self.send_error(404)
         except Exception as exc:
             self._error(exc)
@@ -612,6 +615,51 @@ def get_checkpoint_state() -> dict:
                 item["checkpoint_error"] = str(exc)
         items.append(item)
     return {"updated_at": datetime.now().isoformat(timespec="seconds"), "items": items}
+
+
+def checkpoint_paths_for_project(project_config: str) -> list[Path]:
+    project_config = safe_config_name(project_config, DEFAULT_PROJECT_CONFIG)
+    project = load_yaml(ROOT / "config" / project_config)
+    checkpoint_db = resolve_path(ROOT, project.get("paths", {}).get("checkpoint_db", "data/checkpoint/progress.sqlite"))
+    candidates = [checkpoint_db, Path(str(checkpoint_db) + "-wal"), Path(str(checkpoint_db) + "-shm")]
+    return [path.resolve() for path in candidates]
+
+
+def clear_checkpoints(payload: dict) -> dict:
+    confirm = str(payload.get("confirm") or "").strip()
+    if confirm != "CLEAR":
+        raise ValueError("confirmation mismatch")
+    active_runs = [run for run in list_dashboard_runs().get("runs", []) if run.get("active")]
+    if active_runs:
+        names = ", ".join(str(run.get("project_config") or run.get("pid")) for run in active_runs)
+        raise ValueError(f"cannot clear checkpoints while tasks are running: {names}")
+
+    requested = payload.get("project_configs")
+    if isinstance(requested, list) and requested:
+        project_configs = [safe_config_name(item, DEFAULT_PROJECT_CONFIG) for item in requested]
+    else:
+        project_configs = [name for name in EDITABLE_PROJECT_CONFIGS if (ROOT / "config" / name).exists()]
+
+    deleted: list[str] = []
+    missing: list[str] = []
+    for project_config in sorted(set(project_configs)):
+        for path in checkpoint_paths_for_project(project_config):
+            try:
+                path.relative_to(ROOT)
+            except ValueError:
+                raise ValueError(f"checkpoint path is outside sandbox: {path}")
+            if path.exists():
+                path.unlink()
+                deleted.append(path.relative_to(ROOT).as_posix())
+            else:
+                missing.append(path.relative_to(ROOT).as_posix())
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "missing": missing,
+        "project_configs": sorted(set(project_configs)),
+        "cleared_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 def project_progress(project_config: str) -> dict:

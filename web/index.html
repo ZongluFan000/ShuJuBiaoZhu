@@ -180,8 +180,13 @@
       <div class="panel">
         <div class="panel-title">
           <h2>Checkpoint 状态</h2>
-          <span id="checkpointUpdated"></span>
+          <div class="panel-actions">
+            <span id="checkpointUpdated"></span>
+            <button id="clearCheckpointsBtn" class="danger-btn">清除所有 Checkpoint</button>
+          </div>
         </div>
+        <p class="status">清除 Checkpoint 后，已跑过的患者和规则不会再被跳过；历史输出文件不会删除。</p>
+        <p id="checkpointActionStatus" class="status"></p>
         <div id="checkpointList" class="checkpoint-list"></div>
       </div>
     </section>
