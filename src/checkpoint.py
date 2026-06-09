@@ -35,11 +35,21 @@ class Checkpoint:
               done_rules integer default 0,
               failed_rules integer default 0,
               last_error text default '',
+              started_at datetime default current_timestamp,
+              elapsed_seconds real default 0,
               updated_at datetime default current_timestamp
             )
             """
         )
+        self._ensure_patient_status_columns()
         self.conn.commit()
+
+    def _ensure_patient_status_columns(self) -> None:
+        columns = {row[1] for row in self.conn.execute("pragma table_info(patient_status)").fetchall()}
+        if "started_at" not in columns:
+            self.conn.execute("alter table patient_status add column started_at datetime default ''")
+        if "elapsed_seconds" not in columns:
+            self.conn.execute("alter table patient_status add column elapsed_seconds real default 0")
 
     def done(self, patient_sn: str, trial_id: str, standard_no: str) -> bool:
         with self.lock:
@@ -74,12 +84,14 @@ class Checkpoint:
         done_rules: int,
         failed_rules: int,
         last_error: str = "",
+        elapsed_seconds: float | None = None,
     ) -> None:
+        elapsed_value = 0.0 if elapsed_seconds is None else round(float(elapsed_seconds), 3)
         with self.lock:
             self.conn.execute(
                 """
-                insert into patient_status(patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                insert into patient_status(patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error, started_at, elapsed_seconds, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, current_timestamp, ?, current_timestamp)
                 on conflict(patient_sn)
                 do update set source_file=excluded.source_file,
                               status=excluded.status,
@@ -87,9 +99,11 @@ class Checkpoint:
                               done_rules=excluded.done_rules,
                               failed_rules=excluded.failed_rules,
                               last_error=excluded.last_error,
+                              started_at=case when excluded.status='running' then current_timestamp else patient_status.started_at end,
+                              elapsed_seconds=case when excluded.status='running' then 0 else excluded.elapsed_seconds end,
                               updated_at=current_timestamp
                 """,
-                (patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error[:1000]),
+                (patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error[:1000], elapsed_value),
             )
             self.conn.commit()
 

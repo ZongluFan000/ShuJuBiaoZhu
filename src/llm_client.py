@@ -20,6 +20,7 @@ class LLMConfig:
     max_retries: int = 2
     temperature: float = 0.0
     max_tokens: int = 1024
+    stream: bool = False
     enable_thinking: bool | None = None
     torch_dtype: str = "float16"
     device_map: str = "auto"
@@ -84,6 +85,7 @@ class LLMClient:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
+            "stream": self.config.stream,
         }
         if self.config.upstream_url:
             payload["apiUrl"] = self.config.upstream_url
@@ -94,14 +96,47 @@ class LLMClient:
         for attempt in range(max(1, self.config.max_retries)):
             try:
                 req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                content = _extract_assistant_text(data)
+                with _direct_urlopen(req, timeout=self.config.timeout_seconds) as resp:
+                    raw = resp.read().decode("utf-8")
+                if self.config.stream:
+                    content = _extract_streaming_text(raw)
+                else:
+                    data = json.loads(raw)
+                    content = _extract_assistant_text(data)
                 return _parse_json_content(content)
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 last_error = exc
                 time.sleep(min(20, 2**attempt))
         raise RuntimeError(f"LLM API call failed: {last_error}")
+
+
+def _direct_urlopen(req: urllib.request.Request, timeout: int):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(req, timeout=timeout)
+
+
+def _extract_streaming_text(raw: str) -> str:
+    parts: list[str] = []
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith("data:"):
+            text = text[5:].strip()
+        if not text or text == "[DONE]":
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            parts.append(text)
+            continue
+        try:
+            chunk = _extract_assistant_text(data)
+        except ValueError:
+            chunk = ""
+        if chunk:
+            parts.append(chunk)
+    return "".join(parts).strip()
 
 
 def _extract_assistant_text(data: Any) -> str:

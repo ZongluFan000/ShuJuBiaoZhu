@@ -111,6 +111,10 @@
           <button id="clearPatientsBtn">清空</button>
           <input id="patientSearch" type="search" placeholder="搜索患者文件">
         </div>
+        <div class="toolbar">
+          <input id="patientDirInput" type="text" placeholder="输入患者文件夹路径，例如 data/input/patient">
+          <button id="savePatientDirBtn">保存患者目录</button>
+        </div>
         <div class="pathbar"><span>患者目录</span><code id="patientDir">-</code></div>
         <p id="patientSelectionSummary" class="status">-</p>
         <div id="patientList" class="patient-list"></div>
@@ -189,6 +193,10 @@
           <button id="saveConfigBtn" class="primary">保存配置</button>
         </div>
         <div class="toolbar">
+          <select id="configTypeSelect">
+            <option value="project">项目配置</option>
+            <option value="model">模型接口配置</option>
+          </select>
           <select id="configSelect"></select>
           <button id="reloadConfigBtn">重新载入</button>
         </div>

@@ -1,0 +1,31 @@
+# Local model/API credentials. Copy from config/*.example.yaml when needed.
+config/model_api.yaml
+config/model_api_1.yaml
+config/model_api_2.yaml
+config/model_internal_health.yaml
+
+# Patient data and local selections should not be committed.
+data/input/patient/
+data/input/patient100/
+data/selected_patients.json
+
+# Runtime outputs, checkpoints, logs, and dashboard state.
+data/checkpoint*/
+data/logs*/
+data/output*/
+data/dashboard_runs/
+run-summaries/
+
+# Temporary smoke-test project configs.
+config/project_local_server_smoke.yaml
+
+# Python/generated files.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local editor/system files.
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak

@@ -1,6 +1,8 @@
 const state = {
   currentDir: ".",
   configs: [],
+  configGroups: {project_configs: [], model_configs: []},
+  configType: localStorage.getItem("annotationConfigType") || "project",
   selectedConfig: "",
   patients: [],
   projectState: {project_configs: [], model_configs: [], pairs: [], runs: []},
@@ -72,6 +74,14 @@ function formatDateTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString("zh-CN", {hour12: false});
+}
+
+function formatDuration(seconds) {
+  const value = Number(seconds || 0);
+  if (!value) return "-";
+  if (value < 60) return `${value.toFixed(1)} 秒`;
+  if (value < 3600) return `${(value / 60).toFixed(1)} 分钟`;
+  return `${(value / 3600).toFixed(2)} 小时`;
 }
 
 function humanSize(bytes) {
@@ -279,6 +289,7 @@ function progressCard(item) {
         <span>剩余 ${remaining}</span>
         <span>${item.total_patients} 个患者 × ${item.total_rules} 条规则</span>
         <span>成功 ${item.done_tasks} / 失败 ${item.failed_tasks}</span>
+        <span>平均每患者 ${formatDuration(item.avg_patient_elapsed_seconds)}</span>
         <span>最近更新 ${formatDateTime(item.latest_updated)}</span>
       </div>
       <div class="progress-path">${escapeHtml(item.output_dir)}</div>
@@ -304,14 +315,35 @@ async function loadStats() {
 
 async function loadConfigs() {
   const data = await api("/api/configs");
-  state.configs = data.configs || [];
-  if (!state.selectedConfig && state.configs.length) {
-    state.selectedConfig = state.configs.includes("model_api.yaml") ? "model_api.yaml" : state.configs[0];
+  state.configGroups = {
+    project_configs: data.project_configs || data.configs || [],
+    model_configs: data.model_configs || []
+  };
+  state.configs = currentConfigList();
+  if (!state.configs.includes(state.selectedConfig)) {
+    state.selectedConfig = state.configs[0] || "";
   }
+  $("configTypeSelect").value = state.configType;
   $("configSelect").innerHTML = optionList(state.configs, state.selectedConfig);
   $("configSelect").value = state.selectedConfig;
   await loadConfig();
   await loadPatients();
+}
+
+function currentConfigList() {
+  return state.configType === "model"
+    ? state.configGroups.model_configs
+    : state.configGroups.project_configs;
+}
+
+async function changeConfigType() {
+  state.configType = $("configTypeSelect").value || "project";
+  localStorage.setItem("annotationConfigType", state.configType);
+  state.configs = currentConfigList();
+  state.selectedConfig = state.configs[0] || "";
+  $("configSelect").innerHTML = optionList(state.configs, state.selectedConfig);
+  $("configSelect").value = state.selectedConfig;
+  await loadConfig();
 }
 
 async function loadConfig() {
@@ -335,10 +367,11 @@ async function saveConfig() {
 }
 
 async function loadPatients() {
-  const config = $("configSelect").value || "project_full_ai_only.yaml";
+  const config = currentModePairs()[0]?.project_config || "project_full_ai_only.yaml";
   const data = await api(`/api/patients?config=${encodeURIComponent(config)}`);
   state.patients = data.items || [];
   $("patientDir").textContent = data.patient_dir || "-";
+  $("patientDirInput").value = data.patient_dir || "";
   $("enablePatientSelection").checked = Boolean(data.selection_enabled);
   renderPatients();
   renderWorkbench();
@@ -382,6 +415,22 @@ async function savePatients(options = {}) {
   }
   state.patientDirty = false;
   await Promise.all([loadPatients(), loadStats(), loadProgress()]);
+}
+
+async function savePatientDir() {
+  const patientDir = $("patientDirInput").value.trim();
+  const projectConfig = currentModePairs()[0]?.project_config || "project_full_ai_only.yaml";
+  if (!patientDir) {
+    $("patientStatus").textContent = "患者目录不能为空。";
+    return;
+  }
+  const data = await api("/api/patient-dir", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({project_config: projectConfig, patient_dir: patientDir})
+  });
+  $("patientStatus").textContent = `已保存患者目录：${data.patient_dir}，共 ${data.total} 个 Excel 文件。`;
+  await Promise.all([loadPatients(), loadStats(), loadProgress(), loadProjects()]);
 }
 
 async function loadProjects() {
@@ -673,9 +722,11 @@ function bind() {
     });
   });
   $("configSelect").addEventListener("change", loadConfig);
+  $("configTypeSelect").addEventListener("change", changeConfigType);
   $("reloadConfigBtn").addEventListener("click", loadConfig);
   $("saveConfigBtn").addEventListener("click", saveConfig);
   $("savePatientsBtn").addEventListener("click", savePatients);
+  $("savePatientDirBtn").addEventListener("click", savePatientDir);
   $("saveConcurrencyBtn").addEventListener("click", saveConcurrency);
   $("runBenchmarkBtn").addEventListener("click", runBenchmark);
   $("startBothBtn").addEventListener("click", () => startRuns("projectPairs"));

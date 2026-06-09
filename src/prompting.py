@@ -109,8 +109,9 @@ def build_optimized_batch_prompt(
         + "\n2. 即使规则文本相似，也必须逐条核对标准内容。"
         + "\n3. items 数量必须与输入规则数量完全一致。"
         + "\n4. 必须使用准确的 trial_id 和 standard_no 对齐，禁止按位置猜测或省略。"
-        + "\n5. 为避免长JSON截断，本批次使用紧凑输出。每个 item 只返回以下字段："
-        + '\n{"trial_id":"...","standard_no":"...","label":"符合/不符合/未知",'
-        + '"explanation":"不超过80个汉字","evidence":"不超过30个汉字","confidence":0.0}'
-        + "\n6. 不要返回 trial_register_id、rule_type 或其他重复字段；后端会从原始规则可靠回填。"
+        + "\n5. 只能返回一个顶层 JSON 对象，禁止连续返回多个 JSON 对象，格式必须为："
+        + '\n{"items":[{"trial_id":"...","standard_no":"...","label":"符合/不符合/未知",'
+        + '"explanation":"不超过80个汉字","evidence":"不超过30个汉字","confidence":0.0}]}'
+        + "\n6. 每条输入规则对应 items 中一个对象，不得输出 JSONL、Markdown 或额外说明。"
+        + "\n7. 不要返回 trial_register_id、rule_type 或其他重复字段；后端会从原始规则可靠回填。"
     )

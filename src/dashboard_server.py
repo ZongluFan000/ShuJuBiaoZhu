@@ -25,6 +25,16 @@ TEXT_SUFFIXES = {".txt", ".csv", ".json", ".yaml", ".yml", ".log", ".md", ".py",
 SELECTION_FILE = ROOT / "data" / "selected_patients.json"
 DEFAULT_PROJECT_CONFIG = "project_full_ai_only.yaml"
 DEFAULT_MODEL_CONFIG = "model_api.yaml"
+EDITABLE_PROJECT_CONFIGS = [
+    "project_full_ai_only.yaml",
+    "project_full_ai_only_model1.yaml",
+    "project_full_ai_only_model2.yaml",
+]
+EDITABLE_MODEL_CONFIGS = [
+    "model_api.yaml",
+    "model_api_1.yaml",
+    "model_api_2.yaml",
+]
 RUN_DIR = ROOT / "data" / "dashboard_runs"
 MODEL_HEALTH_PROMPT = """请只输出一个合法 JSON 对象，不要输出 Markdown：
 {"items":[{"label":"未知","explanation":"连通性测试","evidence":"测试","confidence":0.1}]}
@@ -40,7 +50,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/static/"):
                 self._serve_file(WEB / parsed.path.lstrip("/"))
             elif parsed.path == "/api/configs":
-                self._json({"configs": sorted(p.name for p in (ROOT / "config").glob("*.yaml"))})
+                project_configs = [name for name in EDITABLE_PROJECT_CONFIGS if (ROOT / "config" / name).exists()]
+                model_configs = [name for name in EDITABLE_MODEL_CONFIGS if (ROOT / "config" / name).exists()]
+                self._json({
+                    "configs": project_configs,
+                    "project_configs": project_configs,
+                    "model_configs": model_configs,
+                })
             elif parsed.path == "/api/config":
                 name = parse_qs(parsed.query).get("name", [""])[0]
                 path = self._safe_config(name)
@@ -96,6 +112,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     encoding="utf-8",
                 )
                 self._json({"ok": True, "selected": len(files), "path": str(SELECTION_FILE)})
+                return
+            if parsed.path == "/api/patient-dir":
+                self._json(save_patient_dir(payload))
                 return
             if parsed.path == "/api/concurrency":
                 action = str(payload.get("action", "set"))
@@ -273,6 +292,27 @@ def list_patient_workbooks(patient_dir: Path) -> list[Path]:
     if not patient_dir.exists():
         return []
     return sorted(path for path in patient_dir.glob("*.xlsx") if not path.name.startswith("~$"))
+
+
+def save_patient_dir(payload: dict) -> dict:
+    project_config = safe_config_name(payload.get("project_config", DEFAULT_PROJECT_CONFIG), DEFAULT_PROJECT_CONFIG)
+    raw_dir = str(payload.get("patient_dir") or "").strip().strip('"')
+    if not raw_dir:
+        raise ValueError("患者目录不能为空")
+    path = resolve_path(ROOT, raw_dir).resolve()
+    if not path.exists() or not path.is_dir():
+        raise ValueError(f"患者目录不存在：{path}")
+    files = list_patient_workbooks(path)
+    if not files:
+        raise ValueError(f"患者目录中没有 xlsx 文件：{path}")
+    value = path.as_posix()
+    try:
+        rel = path.relative_to(ROOT).as_posix()
+        value = rel
+    except ValueError:
+        pass
+    update_yaml_scalar(ROOT / "config" / project_config, ["paths", "patient_dir"], value)
+    return {"ok": True, "project_config": project_config, "patient_dir": str(path), "total": len(files)}
 
 
 def load_selection() -> dict:
@@ -601,8 +641,11 @@ def project_progress(project_config: str) -> dict:
     if checkpoint_db.exists():
         try:
             conn = sqlite3.connect(f"file:{checkpoint_db}?mode=ro", uri=True)
+            status_columns = {row[1] for row in conn.execute("pragma table_info(patient_status)").fetchall()}
+            elapsed_expr = "elapsed_seconds" if "elapsed_seconds" in status_columns else "0 as elapsed_seconds"
+            started_expr = "started_at" if "started_at" in status_columns else "'' as started_at"
             patient_rows = conn.execute(
-                "select patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error, updated_at from patient_status"
+                f"select patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error, updated_at, {elapsed_expr}, {started_expr} from patient_status"
             ).fetchall()
             scoped_patient_rows = [
                 row for row in patient_rows
@@ -633,6 +676,12 @@ def project_progress(project_config: str) -> dict:
             for row_item in scoped_patient_rows:
                 status = str(row_item[2])
                 patient_counts[status] = patient_counts.get(status, 0) + 1
+            completed_elapsed = [
+                float(row_item[8] or 0)
+                for row_item in scoped_patient_rows
+                if str(row_item[2]) == "done" and float(row_item[8] or 0) > 0
+            ]
+            avg_patient_elapsed = round(sum(completed_elapsed) / len(completed_elapsed), 2) if completed_elapsed else 0
             latest_updated = str(row[0] or "") if row else ""
             recent_patients = [
                 {
@@ -644,6 +693,8 @@ def project_progress(project_config: str) -> dict:
                     "failed_rules": int(row[5] or 0),
                     "last_error": str(row[6] or ""),
                     "updated_at": str(row[7] or ""),
+                    "elapsed_seconds": round(float(row[8] or 0), 2),
+                    "started_at": str(row[9] or ""),
                 }
                 for row in sorted(scoped_patient_rows, key=lambda item: str(item[7] or ""), reverse=True)[:20]
             ]
@@ -652,8 +703,10 @@ def project_progress(project_config: str) -> dict:
             task_counts = {}
             patient_counts = {}
             recent_patients = []
+            avg_patient_elapsed = 0
     else:
         recent_patients = []
+        avg_patient_elapsed = 0
     done = int(task_counts.get("done", 0))
     failed = int(task_counts.get("failed", 0))
     processed = min(done + failed, total_tasks) if total_tasks else done + failed
@@ -685,6 +738,7 @@ def project_progress(project_config: str) -> dict:
         "failed_tasks": failed,
         "percent": percent,
         "patient_counts": patient_counts,
+        "avg_patient_elapsed_seconds": avg_patient_elapsed,
         "task_counts": task_counts,
         "recent_patients": recent_patients,
         "latest_updated": latest_updated,

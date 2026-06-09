@@ -57,7 +57,7 @@ RESULT_FIELDS = [
 ]
 
 FAILURE_FIELDS = ["patient_sn", "patient_file", "trial_id", "standard_no", "rule_type", "error", "run_id"]
-PATIENT_STATUS_FIELDS = ["patient_sn", "source_file", "status", "total_rules", "done_rules", "failed_rules", "last_error", "run_id", "updated_at"]
+PATIENT_STATUS_FIELDS = ["patient_sn", "source_file", "status", "total_rules", "done_rules", "failed_rules", "last_error", "run_id", "elapsed_seconds", "updated_at"]
 MODEL_HEALTH_PROMPT = """请只输出一个合法 JSON 对象，不要输出 Markdown：
 {"items":[{"label":"未知","explanation":"连通性测试","evidence":"测试","confidence":0.1}]}
 """
@@ -378,13 +378,14 @@ def process_patient(
     except Exception as exc:
         patient_sn = patient_file.stem
         failure = {"patient_sn": patient_sn, "patient_file": str(patient_file), "trial_id": "", "standard_no": "", "rule_type": "", "error": f"load_patient: {exc}", "run_id": run_id}
-        checkpoint.mark_patient(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc))
+        checkpoint.mark_patient(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), 0)
         with result_lock:
             failures.append(failure)
         failure_writer.append(failure)
-        patient_writer.append(_patient_status_row(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), run_id))
+        patient_writer.append(_patient_status_row(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), run_id, 0))
         return failure
 
+    patient_started = time.time()
     checkpoint.mark_patient(patient.patient_sn, patient.source_file, "running", len(rules), 0, 0)
     done_count = 0
     failed_count = 0
@@ -560,8 +561,9 @@ def process_patient(
         status = "partial"
     else:
         status = "failed"
-    checkpoint.mark_patient(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error)
-    status_row = _patient_status_row(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, run_id)
+    patient_elapsed = time.time() - patient_started
+    checkpoint.mark_patient(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, patient_elapsed)
+    status_row = _patient_status_row(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, run_id, patient_elapsed)
     patient_writer.append(status_row)
     return status_row
 
@@ -596,13 +598,14 @@ def process_patient_optimized(
     except Exception as exc:
         patient_sn = patient_file.stem
         failure = {"patient_sn": patient_sn, "patient_file": str(patient_file), "trial_id": "", "standard_no": "", "rule_type": "", "error": f"load_patient: {exc}", "run_id": run_id}
-        checkpoint.mark_patient(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc))
+        checkpoint.mark_patient(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), 0)
         with result_lock:
             failures.append(failure)
         failure_writer.append(failure)
-        patient_writer.append(_patient_status_row(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), run_id))
+        patient_writer.append(_patient_status_row(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), run_id, 0))
         return failure
 
+    patient_started = time.time()
     checkpoint.mark_patient(patient.patient_sn, patient.source_file, "running", len(rules), 0, 0)
     done_count = 0
     failed_count = 0
@@ -768,8 +771,9 @@ def process_patient_optimized(
         status = "partial"
     else:
         status = "failed"
-    checkpoint.mark_patient(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error)
-    status_row = _patient_status_row(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, run_id)
+    patient_elapsed = time.time() - patient_started
+    checkpoint.mark_patient(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, patient_elapsed)
+    status_row = _patient_status_row(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, run_id, patient_elapsed)
     patient_writer.append(status_row)
     return status_row
 
@@ -992,7 +996,7 @@ def _filter_pending_optimized_batches(
     return pending_batches
 
 
-def _patient_status_row(patient_sn: str, source_file: str, status: str, total_rules: int, done_rules: int, failed_rules: int, last_error: str, run_id: str) -> dict[str, Any]:
+def _patient_status_row(patient_sn: str, source_file: str, status: str, total_rules: int, done_rules: int, failed_rules: int, last_error: str, run_id: str, elapsed_seconds: float = 0) -> dict[str, Any]:
     return {
         "patient_sn": patient_sn,
         "source_file": source_file,
@@ -1002,6 +1006,7 @@ def _patient_status_row(patient_sn: str, source_file: str, status: str, total_ru
         "failed_rules": failed_rules,
         "last_error": last_error,
         "run_id": run_id,
+        "elapsed_seconds": round(float(elapsed_seconds or 0), 3),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
 

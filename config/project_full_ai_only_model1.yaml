@@ -7,7 +7,7 @@ paths:
 
 run:
   mode: "full"
-  concurrency: 2
+  concurrency: 1
   rule_concurrency: 4
   resume: true
   write_xlsx: false
