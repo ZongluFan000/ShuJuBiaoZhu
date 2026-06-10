@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 import time
@@ -76,10 +77,6 @@ class LLMClient:
         }
 
     def _call_api(self, prompt: str) -> dict[str, Any]:
-        url = self.config.base_url.rstrip("/") + "/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
         payload = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
@@ -91,23 +88,67 @@ class LLMClient:
             payload["apiUrl"] = self.config.upstream_url
         if self.config.enable_thinking is not None:
             payload["chat_template_kwargs"] = {"enable_thinking": self.config.enable_thinking}
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         last_error: Exception | None = None
         for attempt in range(max(1, self.config.max_retries)):
             try:
-                req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-                with _direct_urlopen(req, timeout=self.config.timeout_seconds) as resp:
-                    raw = resp.read().decode("utf-8")
-                if self.config.stream:
-                    content = _extract_streaming_text(raw)
-                else:
-                    data = json.loads(raw)
-                    content = _extract_assistant_text(data)
-                return _parse_json_content(content)
+                content = self._request_api_content(payload)
+                try:
+                    return _parse_json_content(content)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    if not self.config.stream:
+                        try:
+                            return self._repair_json_output(content, prompt, exc)
+                        except Exception as repair_exc:
+                            snippet = content.strip().replace("\r", " ").replace("\n", " ")[:800]
+                            raise ValueError(
+                                f"LLM returned non-JSON output: {exc}; repair_failed={repair_exc}; content_snippet={snippet!r}"
+                            ) from exc
+                    snippet = content.strip().replace("\r", " ").replace("\n", " ")[:800]
+                    raise ValueError(f"LLM returned non-JSON output: {exc}; content_snippet={snippet!r}") from exc
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 last_error = exc
                 time.sleep(min(20, 2**attempt))
         raise RuntimeError(f"LLM API call failed: {last_error}")
+
+    def _request_api_content(self, payload: dict[str, Any]) -> str:
+        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with _direct_urlopen(req, timeout=self.config.timeout_seconds) as resp:
+            raw = resp.read().decode("utf-8")
+        if self.config.stream:
+            return _extract_streaming_text(raw)
+        data = json.loads(raw)
+        return _extract_assistant_text(data)
+
+    def _repair_json_output(self, content: str, original_prompt: str, original_error: Exception) -> dict[str, Any]:
+        if "{" not in content or "}" not in content:
+            raise ValueError("repair skipped because output contains no JSON-like object")
+        repair_prompt = (
+            "请把下面模型输出修复为一个合法 JSON 对象。不要重新判断医学含义，不要添加解释文字，"
+            "只保留或补齐 JSON 结构。目标格式必须是："
+            "{\"items\":[{\"trial_id\":\"\",\"standard_no\":\"\",\"label\":\"符合/不符合/未知\","
+            "\"explanation\":\"\",\"evidence\":\"\",\"confidence\":0.0}]}。\n\n"
+            f"原始解析错误：{original_error}\n\n"
+            f"原始输出：\n{content[:8000]}\n\n"
+            f"原始任务提示片段：\n{original_prompt[:2000]}"
+        )
+        payload = {
+            "model": self.config.model_name,
+            "messages": [{"role": "user", "content": repair_prompt}],
+            "temperature": 0.0,
+            "max_tokens": min(max(int(self.config.max_tokens or 1024), 512), 2048),
+            "stream": False,
+        }
+        if self.config.upstream_url:
+            payload["apiUrl"] = self.config.upstream_url
+        if self.config.enable_thinking is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        repaired = self._request_api_content(payload)
+        return _parse_json_content(repaired)
 
 
 def _direct_urlopen(req: urllib.request.Request, timeout: int):
@@ -160,6 +201,10 @@ def _extract_assistant_text(data: Any) -> str:
             text = _first_text(
                 message.get("content") if isinstance(message, dict) else message,
                 delta.get("content") if isinstance(delta, dict) else delta,
+                message.get("reasoning_content") if isinstance(message, dict) else "",
+                delta.get("reasoning_content") if isinstance(delta, dict) else "",
+                message.get("reasoning") if isinstance(message, dict) else "",
+                delta.get("reasoning") if isinstance(delta, dict) else "",
                 choice.get("text"),
                 choice.get("content"),
             )
@@ -187,7 +232,12 @@ def _extract_assistant_text(data: Any) -> str:
 
     message = data.get("message")
     if isinstance(message, dict):
-        text = _first_text(message.get("content"), message.get("text"))
+        text = _first_text(
+            message.get("content"),
+            message.get("text"),
+            message.get("reasoning_content"),
+            message.get("reasoning"),
+        )
         if text:
             return text
 
@@ -248,9 +298,9 @@ def _stringify_content(value: Any) -> str:
 
 
 def _parse_json_content(content: str) -> dict[str, Any]:
-    text = content.strip()
-    if "</think>" in text:
-        text = text.split("</think>", 1)[1].strip()
+    text = _strip_thinking_text(content).strip()
+    if not text:
+        raise ValueError("empty assistant content after removing thinking text")
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -259,7 +309,19 @@ def _parse_json_content(content: str) -> dict[str, Any]:
     end = text.rfind("}")
     if start >= 0 and end >= start:
         text = text[start : end + 1]
+    elif not text.startswith("{"):
+        raise ValueError(f"assistant content does not contain a JSON object: {text[:120]!r}")
     return json.loads(text)
+
+
+def _strip_thinking_text(text: str) -> str:
+    value = (text or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"(?is)<think>.*?</think>", "", value).strip()
+    if "</think>" in value:
+        value = value.split("</think>", 1)[1].strip()
+    return value
 
 
 def _load_transformers_model(config: LLMConfig):

@@ -68,9 +68,22 @@ class CircuitOpenError(RuntimeError):
 
 
 class FailureCircuitBreaker:
-    def __init__(self, max_consecutive_failures: int):
+    def __init__(
+        self,
+        max_consecutive_failures: int,
+        *,
+        soft_recovery: bool = True,
+        cooldown_seconds: float = 90,
+        max_recovery_rounds: int = 3,
+        health_check: Any | None = None,
+    ):
         self.max_consecutive_failures = max(0, int(max_consecutive_failures or 0))
+        self.soft_recovery = bool(soft_recovery)
+        self.cooldown_seconds = max(0.0, float(cooldown_seconds or 0))
+        self.max_recovery_rounds = max(0, int(max_recovery_rounds or 0))
+        self.health_check = health_check
         self.consecutive_failures = 0
+        self.recovery_rounds = 0
         self.reason = ""
         self.lock = threading.Lock()
 
@@ -90,6 +103,33 @@ class FailureCircuitBreaker:
     def record_failure(self, message: str) -> None:
         if self.max_consecutive_failures <= 0:
             return
+        should_recover = False
+        with self.lock:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures and not self.reason:
+                if self.soft_recovery and self.recovery_rounds < self.max_recovery_rounds:
+                    self.recovery_rounds += 1
+                    should_recover = True
+                else:
+                    self.reason = (
+                        f"模型连续失败 {self.consecutive_failures} 次，已自动熔断暂停；"
+                        f"最后错误：{message[:300]}"
+                    )
+        if should_recover:
+            if self.cooldown_seconds > 0:
+                time.sleep(self.cooldown_seconds)
+            try:
+                if self.health_check:
+                    self.health_check()
+                with self.lock:
+                    self.consecutive_failures = 0
+            except Exception as exc:
+                with self.lock:
+                    self.reason = (
+                        "模型连续失败后软恢复失败，已暂停；"
+                        f"最后错误：{message[:220]}；健康检查错误：{str(exc)[:220]}"
+                    )
+        return
         with self.lock:
             self.consecutive_failures += 1
             if self.consecutive_failures >= self.max_consecutive_failures and not self.reason:
@@ -210,6 +250,9 @@ def main() -> int:
     if patient_limit:
         patient_files = patient_files[:patient_limit]
     checkpoint = Checkpoint(checkpoint_db)
+    recovered_running = checkpoint.recover_running_patients() if bool(run_cfg.get("recover_stale_running", True)) else 0
+    if recovered_running:
+        print(f"已恢复 {recovered_running} 个历史 running 患者状态，避免旧任务残留影响续跑。")
     if args.mode == "retry_failed":
         failed_files = checkpoint.failed_patient_files()
         if failed_files:
@@ -230,7 +273,13 @@ def main() -> int:
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     result_lock = threading.Lock()
-    circuit = FailureCircuitBreaker(int(run_cfg.get("max_consecutive_llm_failures", 5) or 0))
+    circuit = FailureCircuitBreaker(
+        int(run_cfg.get("max_consecutive_llm_failures", 5) or 0),
+        soft_recovery=bool(run_cfg.get("soft_circuit_recovery", True)),
+        cooldown_seconds=float(run_cfg.get("soft_circuit_cooldown_seconds", 90) or 90),
+        max_recovery_rounds=int(run_cfg.get("soft_circuit_max_rounds", 3) or 3),
+        health_check=lambda: check_model_ready(model_config),
+    )
     run_metrics = {
         "llm_calls": 0,
         "optimized_batch_failures": 0,
@@ -301,6 +350,8 @@ def main() -> int:
         "optimized_unit_fallbacks": int(run_metrics["optimized_unit_fallbacks"]),
         "optimization_enabled": bool(optimization_cfg.get("enabled", False)),
         "max_consecutive_llm_failures": circuit.max_consecutive_failures,
+        "soft_circuit_recovery": circuit.soft_recovery,
+        "soft_circuit_recovery_rounds": circuit.recovery_rounds,
         "circuit_open_reason": circuit.reason,
         "patients_seen": len(patient_files),
         "rules_seen": len(rules),
@@ -404,14 +455,22 @@ def process_patient(
 
     def run_batch(batch_rules: list[TrialRule]) -> list[dict[str, Any]]:
         circuit.before_call()
-        _record_llm_call(run_metrics, metrics_lock)
-        try:
-            rows = label_batch(client, template_path, patient, batch_rules, labeling_cfg, run_id)
-        except Exception as exc:
-            circuit.record_failure(str(exc))
-            raise
-        circuit.record_success()
-        return rows
+        batch_retries = max(0, int(labeling_cfg.get("batch_retry_attempts", 1) or 0))
+        last_exc: Exception | None = None
+        for _attempt in range(batch_retries + 1):
+            _record_llm_call(run_metrics, metrics_lock)
+            try:
+                rows = label_batch(client, template_path, patient, batch_rules, labeling_cfg, run_id)
+                circuit.record_success()
+                return rows
+            except Exception as exc:
+                last_exc = exc
+                if _attempt < batch_retries:
+                    time.sleep(min(8, 2 ** _attempt))
+                    continue
+                circuit.record_failure(str(exc))
+                raise
+        raise last_exc or RuntimeError("batch failed")
 
     def write_success(rule: TrialRule, row: dict[str, Any]) -> None:
         nonlocal done_count
@@ -657,15 +716,25 @@ def process_patient_optimized(
 
     def run_batch(batch_units: list[JudgmentUnit]) -> list[tuple[TrialRule, dict[str, Any]]]:
         circuit.before_call()
-        _record_llm_call(run_metrics, metrics_lock)
         representatives = [unit.representative for unit in batch_units]
-        try:
-            representative_rows = label_batch_optimized(client, template_path, patient, representatives, labeling_cfg, run_id)
-        except Exception as exc:
-            _increment_metric(run_metrics, metrics_lock, "optimized_batch_failures")
-            circuit.record_failure(str(exc))
-            raise
-        circuit.record_success()
+        batch_retries = max(0, int(labeling_cfg.get("batch_retry_attempts", 1) or 0))
+        last_exc: Exception | None = None
+        for _attempt in range(batch_retries + 1):
+            _record_llm_call(run_metrics, metrics_lock)
+            try:
+                representative_rows = label_batch_optimized(client, template_path, patient, representatives, labeling_cfg, run_id)
+                circuit.record_success()
+                break
+            except Exception as exc:
+                last_exc = exc
+                if _attempt < batch_retries:
+                    time.sleep(min(8, 2 ** _attempt))
+                    continue
+                _increment_metric(run_metrics, metrics_lock, "optimized_batch_failures")
+                circuit.record_failure(str(exc))
+                raise
+        else:
+            raise last_exc or RuntimeError("optimized batch failed")
         expanded: list[tuple[TrialRule, dict[str, Any]]] = []
         for unit, representative_row in zip(batch_units, representative_rows):
             expanded.extend((member, clone_result_for_rule(representative_row, member)) for member in unit.members)

@@ -129,6 +129,38 @@ class Checkpoint:
             ).fetchall()
         return {str(patient_sn): str(source_file) for patient_sn, source_file in rows if source_file}
 
+    def recover_running_patients(self) -> int:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                select patient_sn, total_rules, done_rules, failed_rules
+                from patient_status
+                where status='running'
+                """
+            ).fetchall()
+            changed = 0
+            for patient_sn, total_rules, done_rules, failed_rules in rows:
+                done = int(done_rules or 0)
+                failed = int(failed_rules or 0)
+                total = int(total_rules or 0)
+                if total and done >= total and failed == 0:
+                    status = "done"
+                elif done > 0 or failed > 0:
+                    status = "partial"
+                else:
+                    status = "failed"
+                self.conn.execute(
+                    """
+                    update patient_status
+                    set status=?, last_error=?, updated_at=current_timestamp
+                    where patient_sn=? and status='running'
+                    """,
+                    (status, "recovered stale running status at startup", patient_sn),
+                )
+                changed += 1
+            self.conn.commit()
+        return changed
+
     def task_status_counts(self) -> dict[str, int]:
         with self.lock:
             rows = self.conn.execute("select status, count(*) from progress group by status").fetchall()

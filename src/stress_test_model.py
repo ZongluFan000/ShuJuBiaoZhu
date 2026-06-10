@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-seconds", type=int, default=None, help="Override model timeout for stress test.")
     parser.add_argument("--max-tokens", type=int, default=None, help="Override max_tokens for stress test.")
     parser.add_argument("--stream", choices=["config", "true", "false"], default="config", help="Override stream setting.")
+    parser.add_argument("--thinking", choices=["config", "true", "false"], default="config", help="Override enable_thinking for stress test.")
     parser.add_argument("--failure-threshold", type=float, default=0.2, help="Stop after a level if failure rate is above this value.")
     parser.add_argument("--max-avg-latency-seconds", type=float, default=60.0, help="Stop before higher levels if average latency exceeds this value.")
     parser.add_argument("--max-p95-latency-seconds", type=float, default=90.0, help="Stop before higher levels if P95 latency exceeds this value.")
@@ -81,6 +82,7 @@ def main() -> int:
 
     print(f"base_url={cfg.base_url}")
     print(f"model_name={cfg.model_name}")
+    print(f"enable_thinking={cfg.enable_thinking}")
     print(f"levels={levels}")
     print(f"requests_per_level={args.requests_per_level} prompt_mode={args.prompt_mode} prompt_samples={len(prompts)}")
 
@@ -92,23 +94,29 @@ def main() -> int:
         if args.warmup > 0:
             print(f"\n[warmup] level={level} requests={args.warmup}")
             warmup_failed = False
+            warmup_rows: list[dict[str, Any]] = []
             for index in range(1, args.warmup + 1):
                 row = call_once(cfg, prompts[(index - 1) % len(prompts)], level, f"warmup-{index}")
+                warmup_rows.append(row)
+                all_rows.append(row)
                 print(format_row(row))
                 if row.get("status") != "success":
                     warmup_failed = True
             if warmup_failed:
+                warmup_success = [row for row in warmup_rows if row.get("status") == "success"]
+                warmup_failed_rows = [row for row in warmup_rows if row.get("status") != "success"]
                 summaries.append({
                     "run_id": run_id,
                     "base_url": cfg.base_url,
                     "model_name": cfg.model_name,
+                    "enable_thinking": cfg.enable_thinking,
                     "prompt_mode": args.prompt_mode,
                     "concurrency": level,
-                    "requests": 0,
-                    "success": 0,
-                    "failed": 0,
-                    "success_rate": 0.0,
-                    "failure_rate": 0.0,
+                    "requests": len(warmup_rows),
+                    "success": len(warmup_success),
+                    "failed": len(warmup_failed_rows),
+                    "success_rate": round(len(warmup_success) / max(len(warmup_rows), 1), 4),
+                    "failure_rate": round(len(warmup_failed_rows) / max(len(warmup_rows), 1), 4),
                     "total_elapsed_seconds": 0,
                     "requests_per_second": 0,
                     "requests_per_minute": 0,
@@ -172,6 +180,10 @@ def apply_overrides(cfg: LLMConfig, args: argparse.Namespace) -> LLMConfig:
         updates["stream"] = True
     elif args.stream == "false":
         updates["stream"] = False
+    if args.thinking == "true":
+        updates["enable_thinking"] = True
+    elif args.thinking == "false":
+        updates["enable_thinking"] = False
     return replace(cfg, **updates) if updates else cfg
 
 
@@ -341,6 +353,7 @@ def summarize_level(
         "run_id": run_id,
         "base_url": cfg.base_url,
         "model_name": cfg.model_name,
+        "enable_thinking": cfg.enable_thinking,
         "prompt_mode": args.prompt_mode,
         "concurrency": level,
         "requests": len(rows),
@@ -487,6 +500,7 @@ def write_outputs(
         "run_id": run_id,
         "base_url": cfg.base_url,
         "model_name": cfg.model_name,
+        "enable_thinking": cfg.enable_thinking,
         "prompt_mode": args.prompt_mode,
         "levels": [item["concurrency"] for item in summaries],
         "requests_per_level": args.requests_per_level,

@@ -630,8 +630,8 @@ def clear_checkpoints(payload: dict) -> dict:
     confirm = str(payload.get("confirm") or "").strip()
     if confirm != "CLEAR":
         raise ValueError("confirmation mismatch")
-    active_pids = active_pid_set()
-    active_runs = [run for run in load_run_records() if run_is_active(run, active_pids)]
+    active_processes = active_process_map()
+    active_runs = [run for run in load_run_records() if run_is_active(run, active_processes)]
     if active_runs:
         names = ", ".join(str(run.get("project_config") or run.get("pid")) for run in active_runs)
         raise ValueError(f"cannot clear checkpoints while tasks are running: {names}")
@@ -795,44 +795,85 @@ def project_progress(project_config: str) -> dict:
     }
 
 
-def active_pid_set() -> set[int]:
+def active_process_map() -> dict[int, dict]:
     try:
         proc = subprocess.run(
-            ["tasklist", "/FO", "CSV", "/NH"],
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine,ExecutablePath | ConvertTo-Json -Compress",
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=5,
+            timeout=10,
         )
         if proc.returncode != 0:
-            return set()
-        pids: set[int] = set()
-        for row in csv.reader(proc.stdout.splitlines()):
-            if len(row) >= 2:
-                try:
-                    pids.add(int(row[1]))
-                except ValueError:
-                    continue
-        return pids
+            return {}
+        raw = json.loads(proc.stdout or "[]")
+        items = raw if isinstance(raw, list) else [raw]
+        processes: dict[int, dict] = {}
+        for item in items:
+            try:
+                pid = int(item.get("ProcessId") or 0)
+            except Exception:
+                continue
+            if pid > 0:
+                processes[pid] = item
+        return processes
     except Exception:
-        return set()
+        return {}
 
 
-def run_is_active(run: dict, active_pids: set[int] | None = None) -> bool:
+def active_pid_set() -> set[int]:
+    return set(active_process_map())
+
+
+def run_is_active(run: dict, active_processes: dict[int, dict] | set[int] | None = None) -> bool:
     try:
         pid = int(run.get("pid") or 0)
     except Exception:
         return False
     if pid <= 0:
         return False
-    if active_pids is not None:
-        return pid in active_pids
-    try:
-        proc = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV"], capture_output=True, text=True, timeout=5)
-        return str(pid) in proc.stdout
-    except Exception:
+    if active_processes is None:
+        active_processes = active_process_map()
+    if isinstance(active_processes, set):
+        if pid not in active_processes:
+            return False
+        active_processes = active_process_map()
+    process = active_processes.get(pid) if isinstance(active_processes, dict) else None
+    if not process:
         return False
+    command = str(process.get("CommandLine") or "")
+    executable = str(process.get("ExecutablePath") or "")
+    name = str(process.get("Name") or "")
+    combined = f"{command} {executable} {name}".lower()
+    root_marker = str(ROOT).lower()
+    return (
+        "src\\main.py" in combined
+        and root_marker in combined
+        and ("python" in combined or "python.exe" in combined)
+    )
+
+
+def mark_inactive_runs_stopped(rows: list[dict], active_processes: dict[int, dict]) -> bool:
+    changed = False
+    now = datetime.now().isoformat(timespec="seconds")
+    for run in rows:
+        if run.get("stopped_at") or run.get("stop_status"):
+            continue
+        try:
+            pid = int(run.get("pid") or 0)
+        except Exception:
+            pid = 0
+        if pid > 0 and not run_is_active(run, active_processes):
+            run["stopped_at"] = now
+            run["stop_status"] = "not_active"
+            changed = True
+    return changed
 
 
 def start_dashboard_runs(payload: dict) -> dict:
@@ -982,7 +1023,7 @@ def stop_dashboard_runs(payload: dict) -> dict:
     project_config = str(payload.get("project_config") or "")
     pid = int(payload.get("pid") or 0)
     rows = load_run_records()
-    active_pids = active_pid_set()
+    active_processes = active_process_map()
     stopped = []
     skipped = []
     for run in rows:
@@ -993,7 +1034,7 @@ def stop_dashboard_runs(payload: dict) -> dict:
             continue
         if project_config and run.get("project_config") != project_config:
             continue
-        if mode == "active" and not run_is_active(run, active_pids):
+        if mode == "active" and not run_is_active(run, active_processes):
             continue
         result = stop_one_run(run)
         if result.get("ok"):
@@ -1116,13 +1157,16 @@ def save_run_records(rows: list[dict]) -> None:
 
 
 def list_dashboard_runs() -> dict:
-    rows = load_run_records()[:20]
-    active_pids = active_pid_set()
+    all_rows = load_run_records()
+    active_processes = active_process_map()
+    if mark_inactive_runs_stopped(all_rows, active_processes):
+        save_run_records(all_rows)
+    rows = all_rows[:20]
     for row in rows:
         log_path = ROOT / str(row.get("log") or "")
         if log_path.exists():
             row["log_updated_at"] = datetime.fromtimestamp(log_path.stat().st_mtime).isoformat(timespec="seconds")
-        row["active"] = run_is_active(row, active_pids)
+        row["active"] = run_is_active(row, active_processes)
     return {"runs": rows}
 
 
