@@ -1,0 +1,10 @@
+provider: "mock"
+base_url: ""
+api_key: ""
+model_name: "mock"
+timeout_seconds: 5
+max_retries: 1
+concurrency: 4
+temperature: 0.0
+max_tokens: 1024
+enable_thinking: false

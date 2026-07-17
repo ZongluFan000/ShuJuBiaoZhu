@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import os
 import sys
 import threading
 import time
@@ -18,10 +20,25 @@ from exporter import LiveCsvWriter, export_outputs
 from llm_client import LLMClient, LLMConfig
 from load_patient import PatientRecord, list_patient_files, load_patient
 from load_rules import TrialRule, load_rules
-from prompting import build_batch_prompt, build_prompt
+from prompting import build_batch_prompt, build_optimized_batch_prompt, build_prompt
 from rule_classifier import classify_rule
+from rule_optimizer import (
+    JudgmentUnit,
+    build_judgment_units,
+    build_optimized_batches,
+    effective_batch_rule_limit,
+    load_batch_plan,
+    optimization_summary,
+    save_batch_plan,
+    validate_optimization_plan,
+)
 from structured_judge import try_structured_judge
-from validator import apply_missing_policy, normalize_llm_batch_result, normalize_llm_result
+from validator import (
+    apply_missing_policy,
+    normalize_llm_batch_result,
+    normalize_llm_batch_result_strict,
+    normalize_llm_result,
+)
 
 
 RESULT_FIELDS = [
@@ -44,7 +61,7 @@ RESULT_FIELDS = [
 ]
 
 FAILURE_FIELDS = ["patient_sn", "patient_file", "trial_id", "standard_no", "rule_type", "error", "run_id"]
-PATIENT_STATUS_FIELDS = ["patient_sn", "source_file", "status", "total_rules", "done_rules", "failed_rules", "last_error", "run_id", "updated_at"]
+PATIENT_STATUS_FIELDS = ["patient_sn", "source_file", "status", "total_rules", "done_rules", "failed_rules", "last_error", "run_id", "elapsed_seconds", "updated_at"]
 MODEL_HEALTH_PROMPT = """请只输出一个合法 JSON 对象，不要输出 Markdown：
 {"items":[{"label":"未知","explanation":"连通性测试","evidence":"测试","confidence":0.1}]}
 """
@@ -55,9 +72,22 @@ class CircuitOpenError(RuntimeError):
 
 
 class FailureCircuitBreaker:
-    def __init__(self, max_consecutive_failures: int):
+    def __init__(
+        self,
+        max_consecutive_failures: int,
+        *,
+        soft_recovery: bool = True,
+        cooldown_seconds: float = 90,
+        max_recovery_rounds: int = 3,
+        health_check: Any | None = None,
+    ):
         self.max_consecutive_failures = max(0, int(max_consecutive_failures or 0))
+        self.soft_recovery = bool(soft_recovery)
+        self.cooldown_seconds = max(0.0, float(cooldown_seconds or 0))
+        self.max_recovery_rounds = max(0, int(max_recovery_rounds or 0))
+        self.health_check = health_check
         self.consecutive_failures = 0
+        self.recovery_rounds = 0
         self.reason = ""
         self.lock = threading.Lock()
 
@@ -77,6 +107,33 @@ class FailureCircuitBreaker:
     def record_failure(self, message: str) -> None:
         if self.max_consecutive_failures <= 0:
             return
+        should_recover = False
+        with self.lock:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures and not self.reason:
+                if self.soft_recovery and self.recovery_rounds < self.max_recovery_rounds:
+                    self.recovery_rounds += 1
+                    should_recover = True
+                else:
+                    self.reason = (
+                        f"模型连续失败 {self.consecutive_failures} 次，已自动熔断暂停；"
+                        f"最后错误：{message[:300]}"
+                    )
+        if should_recover:
+            if self.cooldown_seconds > 0:
+                time.sleep(self.cooldown_seconds)
+            try:
+                if self.health_check:
+                    self.health_check()
+                with self.lock:
+                    self.consecutive_failures = 0
+            except Exception as exc:
+                with self.lock:
+                    self.reason = (
+                        "模型连续失败后软恢复失败，已暂停；"
+                        f"最后错误：{message[:220]}；健康检查错误：{str(exc)[:220]}"
+                    )
+        return
         with self.lock:
             self.consecutive_failures += 1
             if self.consecutive_failures >= self.max_consecutive_failures and not self.reason:
@@ -84,6 +141,66 @@ class FailureCircuitBreaker:
                     f"模型连续失败 {self.consecutive_failures} 次，已自动熔断暂停；"
                     f"最后错误：{message[:300]}"
                 )
+
+
+class RunStabilityTimer:
+    """Estimate wall-clock stable/unstable periods from LLM call outcomes."""
+
+    def __init__(self) -> None:
+        self.started_at = time.time()
+        self.last_transition_at = self.started_at
+        self.state = "stable"
+        self.stable_seconds = 0.0
+        self.unstable_seconds = 0.0
+        self.failure_events = 0
+        self.recovery_events = 0
+        self.lock = threading.Lock()
+
+    def record_success(self) -> None:
+        now = time.time()
+        with self.lock:
+            if self.state == "unstable":
+                self.unstable_seconds += max(0.0, now - self.last_transition_at)
+                self.last_transition_at = now
+                self.state = "stable"
+                self.recovery_events += 1
+
+    def record_failure(self) -> None:
+        now = time.time()
+        with self.lock:
+            self.failure_events += 1
+            if self.state == "stable":
+                self.stable_seconds += max(0.0, now - self.last_transition_at)
+                self.last_transition_at = now
+                self.state = "unstable"
+
+    def snapshot(self, elapsed_seconds: float, llm_calls: int, llm_failures: int) -> dict[str, Any]:
+        now = time.time()
+        with self.lock:
+            stable_seconds = self.stable_seconds
+            unstable_seconds = self.unstable_seconds
+            if self.state == "stable":
+                stable_seconds += max(0.0, now - self.last_transition_at)
+            else:
+                unstable_seconds += max(0.0, now - self.last_transition_at)
+            total = stable_seconds + unstable_seconds
+            if elapsed_seconds > 0 and total > 0:
+                scale = elapsed_seconds / total
+                stable_seconds *= scale
+                unstable_seconds *= scale
+            stability_ratio = stable_seconds / elapsed_seconds if elapsed_seconds > 0 else 0
+            return {
+                "method": "llm_call_outcome_state_estimate",
+                "stable_seconds": round(stable_seconds, 2),
+                "unstable_seconds": round(unstable_seconds, 2),
+                "stability_ratio": round(stability_ratio, 4),
+                "unstable_ratio": round(1 - stability_ratio, 4) if elapsed_seconds > 0 else 0,
+                "failure_events": int(self.failure_events),
+                "recovery_events": int(self.recovery_events),
+                "current_state": self.state,
+                "llm_call_failures": int(llm_failures),
+                "llm_failure_rate": round(llm_failures / llm_calls, 4) if llm_calls else 0,
+            }
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,7 +211,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patient-limit", type=int, default=None)
     parser.add_argument("--rule-limit", type=int, default=None)
     parser.add_argument("--concurrency", type=int, default=None)
+    parser.add_argument("--patient-file", default=None)
     return parser.parse_args()
+
+
+def select_run_output_dir(
+    checkpoint: Checkpoint,
+    base_output_dir: Path,
+    run_id: str,
+    *,
+    mode: str,
+    total_tasks: int,
+) -> tuple[str, Path, bool]:
+    task_counts = checkpoint.task_status_counts()
+    processed = int(task_counts.get("done", 0)) + int(task_counts.get("failed", 0))
+    previous_run_id = checkpoint.get_meta("active_run_id")
+    previous_output_dir = checkpoint.get_meta("active_output_dir")
+    should_resume_previous = bool(
+        previous_run_id
+        and previous_output_dir
+        and checkpoint.has_started_work()
+        and (
+            checkpoint.has_incomplete_work()
+            or mode == "retry_failed"
+            or (total_tasks > 0 and processed < total_tasks)
+        )
+    )
+    if should_resume_previous:
+        return previous_run_id, Path(previous_output_dir), True
+
+    output_dir = base_output_dir / "runs" / run_id
+    checkpoint.set_meta("active_run_id", run_id)
+    checkpoint.set_meta("active_output_dir", str(output_dir))
+    return run_id, output_dir, False
+
+
+def read_existing_csv(path: Path) -> list[dict[str, Any]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open("r", newline="", encoding="utf-8-sig") as handle:
+        return list(csv.DictReader(handle))
 
 
 def main() -> int:
@@ -106,11 +262,15 @@ def main() -> int:
     paths = project["paths"]
     patient_dir = resolve_path(root, paths["patient_dir"])
     rules_file = resolve_path(root, paths["rules_file"])
-    output_dir = resolve_path(root, paths["output_dir"])
+    base_output_dir = resolve_path(root, paths["output_dir"])
+    output_dir = base_output_dir
     log_dir = resolve_path(root, paths.get("log_dir", "data/logs"))
     checkpoint_db = resolve_path(root, paths["checkpoint_db"])
-    template_path = root / "config" / "prompt_templates" / "label_rules.md"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    template_path = resolve_path(
+        root,
+        paths.get("prompt_template", "config/prompt_templates/label_rules.md"),
+    )
+    base_output_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     if args.mode == "check":
@@ -118,6 +278,7 @@ def main() -> int:
 
     run_cfg = project.get("run", {})
     labeling_cfg = project.get("labeling", {})
+    optimization_cfg = project.get("optimization", {})
     model_config = build_llm_config(model_raw)
     patient_limit = args.patient_limit if args.patient_limit is not None else run_cfg.get("patient_limit")
     rule_limit = args.rule_limit if args.rule_limit is not None else run_cfg.get("rule_limit")
@@ -135,17 +296,98 @@ def main() -> int:
             print(f"模型连通性检查失败，已停止启动，避免继续写入大量失败 checkpoint: {exc}")
             return 3
     if args.mode == "full":
-        patient_limit = None
-        rule_limit = None
+        patient_limit = args.patient_limit
+        rule_limit = args.rule_limit
     elif args.mode == "benchmark":
         patient_limit = patient_limit or 100
 
     rules = load_rules(rules_file, limit=rule_limit)
+    optimized_plan_units: list[JudgmentUnit] | None = None
+    optimized_plan_batches: list[list[JudgmentUnit]] | None = None
+    optimized_plan_summary: dict[str, Any] | None = None
+    if bool(optimization_cfg.get("enabled", False)):
+        reviewed_path = resolve_path(root, optimization_cfg.get("reviewed_groups_file", "config/reviewed_equivalent_rules.json"))
+        optimized_plan_units = build_judgment_units(
+            rules,
+            merge_exact_duplicates=bool(optimization_cfg.get("merge_exact_duplicates", True)),
+            reviewed_groups_path=reviewed_path,
+            use_reviewed_equivalent_groups=bool(
+                optimization_cfg.get("use_reviewed_equivalent_groups", False)
+            ),
+        )
+        configured_max_rules = int(optimization_cfg.get("max_batch_rules", labeling_cfg.get("llm_batch_size", 8)) or 8)
+        effective_max_rules = effective_batch_rule_limit(
+            configured_max_rules=configured_max_rules,
+            model_max_tokens=model_config.max_tokens,
+            estimated_output_tokens_per_rule=int(optimization_cfg.get("estimated_output_tokens_per_rule", 110) or 110),
+            output_token_reserve=int(optimization_cfg.get("output_token_reserve", 128) or 128),
+        )
+        batch_plan_file = resolve_path(root, optimization_cfg.get("batch_plan_file", "data/rule_batch_plan_v2.json"))
+        use_fixed_batch_plan = bool(optimization_cfg.get("use_fixed_batch_plan", True))
+        batch_plan_created = False
+        if use_fixed_batch_plan and batch_plan_file.exists():
+            optimized_plan_batches, saved_summary = load_batch_plan(batch_plan_file, rules, optimized_plan_units)
+        else:
+            optimized_plan_batches = build_optimized_batches(
+                optimized_plan_units,
+                max_rules=effective_max_rules,
+                max_rule_chars=int(optimization_cfg.get("max_batch_rule_chars", 3000) or 3000),
+                max_complex_rules=int(optimization_cfg.get("max_complex_batch_rules", 3) or 3),
+                max_simple_rules=int(optimization_cfg.get("max_simple_batch_rules", effective_max_rules) or effective_max_rules),
+                max_normal_rules=int(optimization_cfg.get("max_normal_batch_rules", effective_max_rules) or effective_max_rules),
+                complexity_budget=int(optimization_cfg.get("batch_complexity_budget", 12) or 12),
+            )
+            saved_summary = {}
+            if use_fixed_batch_plan:
+                save_batch_plan(
+                    batch_plan_file,
+                    rules,
+                    optimized_plan_units,
+                    optimized_plan_batches,
+                    {
+                        "configured_max_batch_rules": configured_max_rules,
+                        "effective_max_batch_rules": effective_max_rules,
+                        "max_simple_batch_rules": int(optimization_cfg.get("max_simple_batch_rules", effective_max_rules) or effective_max_rules),
+                        "max_normal_batch_rules": int(optimization_cfg.get("max_normal_batch_rules", effective_max_rules) or effective_max_rules),
+                        "max_complex_batch_rules": int(optimization_cfg.get("max_complex_batch_rules", 3) or 3),
+                        "batch_complexity_budget": int(optimization_cfg.get("batch_complexity_budget", 12) or 12),
+                        "max_batch_rule_chars": int(optimization_cfg.get("max_batch_rule_chars", 3000) or 3000),
+                    },
+                )
+                batch_plan_created = True
+        validate_optimization_plan(rules, optimized_plan_units, optimized_plan_batches)
+        optimized_plan_summary = optimization_summary(optimized_plan_units, optimized_plan_batches, len(rules))
+        if saved_summary:
+            optimized_plan_summary["saved_plan_summary"] = saved_summary
+        optimized_plan_summary["fixed_batch_plan_enabled"] = use_fixed_batch_plan
+        optimized_plan_summary["fixed_batch_plan_file"] = str(batch_plan_file)
+        optimized_plan_summary["fixed_batch_plan_created"] = batch_plan_created
+        optimized_plan_summary["configured_max_batch_rules"] = configured_max_rules
+        optimized_plan_summary["effective_max_batch_rules"] = effective_max_rules
+        optimized_plan_summary["model_max_tokens"] = model_config.max_tokens
+        optimized_plan_summary["compact_prompt_enabled"] = bool(
+            labeling_cfg.get("use_compact_prompt", True)
+        )
+        optimized_plan_summary["exact_duplicate_merge_enabled"] = bool(
+            optimization_cfg.get("merge_exact_duplicates", False)
+        )
+        optimized_plan_summary["reviewed_equivalent_groups_enabled"] = bool(
+            optimization_cfg.get("use_reviewed_equivalent_groups", False)
+        )
     patient_files = list_patient_files(patient_dir)
-    patient_files = apply_patient_selection(root, patient_dir, patient_files)
+    if args.patient_file:
+        requested_name = Path(args.patient_file).name
+        patient_files = [path for path in patient_files if path.name == requested_name]
+        if not patient_files:
+            raise FileNotFoundError(f"指定患者文件不存在：{requested_name}")
+    else:
+        patient_files = apply_patient_selection(root, patient_dir, patient_files)
     if patient_limit:
         patient_files = patient_files[:patient_limit]
     checkpoint = Checkpoint(checkpoint_db)
+    recovered_running = checkpoint.recover_running_patients() if bool(run_cfg.get("recover_stale_running", True)) else 0
+    if recovered_running:
+        print(f"已恢复 {recovered_running} 个历史 running 患者状态，避免旧任务残留影响续跑。")
     if args.mode == "retry_failed":
         failed_files = checkpoint.failed_patient_files()
         if failed_files:
@@ -155,6 +397,16 @@ def main() -> int:
             patient_files = [p for p in patient_files if p.stem in failed_ids]
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id, output_dir, resumed_output = select_run_output_dir(
+        checkpoint,
+        base_output_dir,
+        run_id,
+        mode=args.mode,
+        total_tasks=len(patient_files) * len(rules),
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["LLM_USAGE_LOG_FILE"] = str(output_dir / "llm_usage.jsonl")
+    os.environ["LLM_RUN_ID"] = run_id
     result_writer = LiveCsvWriter(output_dir / "annotation_results_live.csv", RESULT_FIELDS)
     failure_writer = LiveCsvWriter(output_dir / "failed_tasks_live.csv", FAILURE_FIELDS)
     patient_writer = LiveCsvWriter(output_dir / "patient_status_live.csv", PATIENT_STATUS_FIELDS)
@@ -163,15 +415,34 @@ def main() -> int:
     failure_writer.set_lock(write_lock)
     patient_writer.set_lock(write_lock)
 
-    results: list[dict[str, Any]] = []
-    failures: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = read_existing_csv(output_dir / "annotation_results_live.csv") if resumed_output else []
+    failures: list[dict[str, Any]] = read_existing_csv(output_dir / "failed_tasks_live.csv") if resumed_output else []
+    existing_results_count = len(results)
+    existing_failures_count = len(failures)
     result_lock = threading.Lock()
-    circuit = FailureCircuitBreaker(int(run_cfg.get("max_consecutive_llm_failures", 5) or 0))
+    circuit = FailureCircuitBreaker(
+        int(run_cfg.get("max_consecutive_llm_failures", 5) or 0),
+        soft_recovery=bool(run_cfg.get("soft_circuit_recovery", True)),
+        cooldown_seconds=float(run_cfg.get("soft_circuit_cooldown_seconds", 90) or 90),
+        max_recovery_rounds=int(run_cfg.get("soft_circuit_max_rounds", 3) or 3),
+        health_check=lambda: check_model_ready(model_config),
+    )
+    run_metrics = {
+        "llm_calls": 0,
+        "llm_call_successes": 0,
+        "llm_call_failures": 0,
+        "optimized_batch_failures": 0,
+        "optimized_fallback_splits": 0,
+        "optimized_unit_fallbacks": 0,
+    }
+    metrics_lock = threading.Lock()
+    stability_timer = RunStabilityTimer()
     started = time.time()
 
     def worker(patient_file: Path) -> dict[str, Any]:
         client = LLMClient(model_config)
-        return process_patient(
+        process = process_patient_optimized if bool(optimization_cfg.get("enabled", False)) else process_patient
+        return process(
             patient_file=patient_file,
             rules=rules,
             client=client,
@@ -188,6 +459,12 @@ def main() -> int:
             result_lock=result_lock,
             rule_concurrency=rule_concurrency,
             circuit=circuit,
+            run_metrics=run_metrics,
+            metrics_lock=metrics_lock,
+            stability_timer=stability_timer,
+            optimization_cfg=optimization_cfg,
+            root=root,
+            prebuilt_optimized_batches=optimized_plan_batches,
         )
 
     patient_summaries: list[dict[str, Any]] = []
@@ -211,26 +488,56 @@ def main() -> int:
     task_counts = checkpoint.task_status_counts()
     patient_rows = checkpoint.patient_rows()
     failed_task_rows = checkpoint.failed_task_rows()
+    patient_timing = build_patient_timing_summary(elapsed, patient_rows, len(patient_files), {path.stem for path in patient_files})
+    server_stability = stability_timer.snapshot(
+        elapsed,
+        int(run_metrics["llm_calls"]),
+        int(run_metrics["llm_call_failures"]),
+    )
+    llm_usage_summary = summarize_llm_usage(output_dir / "llm_usage.jsonl")
     summary = {
         "mode": args.mode,
         "run_id": run_id,
+        "resumed_output": resumed_output,
+        "base_output_dir": str(base_output_dir),
+        "output_dir": str(output_dir),
         "concurrency": concurrency,
         "rule_concurrency": rule_concurrency,
         "group_rules_for_llm": bool(labeling_cfg.get("group_rules_for_llm", False)),
         "llm_batch_size": int(labeling_cfg.get("llm_batch_size", 1) or 1),
+        "llm_calls": int(run_metrics["llm_calls"]),
+        "llm_call_successes": int(run_metrics["llm_call_successes"]),
+        "llm_call_failures": int(run_metrics["llm_call_failures"]),
+        "optimized_batch_failures": int(run_metrics["optimized_batch_failures"]),
+        "optimized_fallback_splits": int(run_metrics["optimized_fallback_splits"]),
+        "optimized_unit_fallbacks": int(run_metrics["optimized_unit_fallbacks"]),
+        "optimization_enabled": bool(optimization_cfg.get("enabled", False)),
         "max_consecutive_llm_failures": circuit.max_consecutive_failures,
+        "soft_circuit_recovery": circuit.soft_recovery,
+        "soft_circuit_recovery_rounds": circuit.recovery_rounds,
         "circuit_open_reason": circuit.reason,
         "patients_seen": len(patient_files),
         "rules_seen": len(rules),
-        "results_written_this_run": len(results),
-        "failures_this_run": len(failures),
+        "results_loaded_from_previous_run": existing_results_count,
+        "failures_loaded_from_previous_run": existing_failures_count,
+        "results_written_this_run": max(0, len(results) - existing_results_count),
+        "failures_this_run": max(0, len(failures) - existing_failures_count),
+        "results_written_total_in_output_file": len(results),
+        "failures_total_in_output_file": len(failures),
         "checkpoint_task_counts": task_counts,
         "failed_patients": len([r for r in patient_rows if str(r.get("status")) in {"failed", "partial"} or int(r.get("failed_rules") or 0) > 0]),
         "elapsed_seconds": round(elapsed, 2),
+        "avg_wall_seconds_per_patient": patient_timing["avg_wall_seconds_per_patient"],
+        "avg_pure_patient_elapsed_seconds": patient_timing["avg_pure_patient_seconds_observed"],
+        "patient_timing": patient_timing,
+        "server_stability": server_stability,
+        "llm_usage": llm_usage_summary,
         "estimated_40000_patients_days": estimate_days(elapsed, len(patient_files), 40000),
         "model_provider": model_raw.get("provider"),
         "model_name": model_raw.get("model_name"),
     }
+    if optimized_plan_summary is not None:
+        summary["optimization_plan"] = optimized_plan_summary
     export_outputs(
         output_dir,
         results,
@@ -249,13 +556,32 @@ def main() -> int:
                 f"rule_concurrency={rule_concurrency}",
                 f"group_rules_for_llm={bool(labeling_cfg.get('group_rules_for_llm', False))}",
                 f"llm_batch_size={int(labeling_cfg.get('llm_batch_size', 1) or 1)}",
+                f"llm_calls={int(run_metrics['llm_calls'])}",
+                f"llm_call_successes={int(run_metrics['llm_call_successes'])}",
+                f"llm_call_failures={int(run_metrics['llm_call_failures'])}",
+                f"optimization_enabled={bool(optimization_cfg.get('enabled', False))}",
                 f"max_consecutive_llm_failures={circuit.max_consecutive_failures}",
                 f"circuit_open_reason={circuit.reason}",
                 f"patients_seen={len(patient_files)}",
                 f"rules_seen={len(rules)}",
-                f"results_written_this_run={len(results)}",
-                f"failures_this_run={len(failures)}",
+                f"resumed_output={resumed_output}",
+                f"output_dir={output_dir}",
+                f"results_loaded_from_previous_run={existing_results_count}",
+                f"failures_loaded_from_previous_run={existing_failures_count}",
+                f"results_written_this_run={max(0, len(results) - existing_results_count)}",
+                f"failures_this_run={max(0, len(failures) - existing_failures_count)}",
+                f"results_written_total_in_output_file={len(results)}",
+                f"failures_total_in_output_file={len(failures)}",
                 f"elapsed_seconds={round(elapsed, 2)}",
+                f"avg_wall_seconds_per_patient={patient_timing['avg_wall_seconds_per_patient']}",
+                f"avg_pure_patient_elapsed_seconds={patient_timing['avg_pure_patient_seconds_observed']}",
+                f"server_stable_seconds={server_stability['stable_seconds']}",
+                f"server_unstable_seconds={server_stability['unstable_seconds']}",
+                f"server_stability_ratio={server_stability['stability_ratio']}",
+                f"llm_usage_rows={llm_usage_summary['rows']}",
+                f"prompt_cache_hit_tokens={llm_usage_summary['prompt_cache_hit_tokens']}",
+                f"prompt_cache_miss_tokens={llm_usage_summary['prompt_cache_miss_tokens']}",
+                f"prompt_cache_hit_ratio={llm_usage_summary['prompt_cache_hit_ratio']}",
             ]
         ),
         encoding="utf-8",
@@ -281,19 +607,26 @@ def process_patient(
     result_lock: threading.Lock,
     rule_concurrency: int,
     circuit: FailureCircuitBreaker,
+    run_metrics: dict[str, int] | None = None,
+    metrics_lock: threading.Lock | None = None,
+    stability_timer: RunStabilityTimer | None = None,
+    optimization_cfg: dict[str, Any] | None = None,
+    root: Path | None = None,
+    prebuilt_optimized_batches: list[list[JudgmentUnit]] | None = None,
 ) -> dict[str, Any]:
     try:
         patient = load_patient(patient_file)
     except Exception as exc:
         patient_sn = patient_file.stem
         failure = {"patient_sn": patient_sn, "patient_file": str(patient_file), "trial_id": "", "standard_no": "", "rule_type": "", "error": f"load_patient: {exc}", "run_id": run_id}
-        checkpoint.mark_patient(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc))
+        checkpoint.mark_patient(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), 0)
         with result_lock:
             failures.append(failure)
         failure_writer.append(failure)
-        patient_writer.append(_patient_status_row(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), run_id))
+        patient_writer.append(_patient_status_row(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), run_id, 0))
         return failure
 
+    patient_started = time.time()
     checkpoint.mark_patient(patient.patient_sn, patient.source_file, "running", len(rules), 0, 0)
     done_count = 0
     failed_count = 0
@@ -301,23 +634,37 @@ def process_patient(
 
     def run_rule(rule: TrialRule) -> dict[str, Any]:
         circuit.before_call()
+        _record_llm_call(run_metrics, metrics_lock)
         try:
             row = label_one(client, template_path, patient, rule, labeling_cfg, run_id)
         except Exception as exc:
+            _record_llm_failure(run_metrics, metrics_lock, stability_timer)
             circuit.record_failure(str(exc))
             raise
+        _record_llm_success(run_metrics, metrics_lock, stability_timer)
         circuit.record_success()
         return row
 
     def run_batch(batch_rules: list[TrialRule]) -> list[dict[str, Any]]:
         circuit.before_call()
-        try:
-            rows = label_batch(client, template_path, patient, batch_rules, labeling_cfg, run_id)
-        except Exception as exc:
-            circuit.record_failure(str(exc))
-            raise
-        circuit.record_success()
-        return rows
+        batch_retries = max(0, int(labeling_cfg.get("batch_retry_attempts", 1) or 0))
+        last_exc: Exception | None = None
+        for _attempt in range(batch_retries + 1):
+            _record_llm_call(run_metrics, metrics_lock)
+            try:
+                rows = label_batch(client, template_path, patient, batch_rules, labeling_cfg, run_id)
+                _record_llm_success(run_metrics, metrics_lock, stability_timer)
+                circuit.record_success()
+                return rows
+            except Exception as exc:
+                _record_llm_failure(run_metrics, metrics_lock, stability_timer)
+                last_exc = exc
+                if _attempt < batch_retries:
+                    time.sleep(min(8, 2 ** _attempt))
+                    continue
+                circuit.record_failure(str(exc))
+                raise
+        raise last_exc or RuntimeError("batch failed")
 
     def write_success(rule: TrialRule, row: dict[str, Any]) -> None:
         nonlocal done_count
@@ -467,8 +814,234 @@ def process_patient(
         status = "partial"
     else:
         status = "failed"
-    checkpoint.mark_patient(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error)
-    status_row = _patient_status_row(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, run_id)
+    patient_elapsed = time.time() - patient_started
+    checkpoint.mark_patient(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, patient_elapsed)
+    status_row = _patient_status_row(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, run_id, patient_elapsed)
+    patient_writer.append(status_row)
+    return status_row
+
+
+def process_patient_optimized(
+    patient_file: Path,
+    rules: list[TrialRule],
+    client: LLMClient,
+    template_path: Path,
+    labeling_cfg: dict[str, Any],
+    run_cfg: dict[str, Any],
+    checkpoint: Checkpoint,
+    run_id: str,
+    result_writer: LiveCsvWriter,
+    failure_writer: LiveCsvWriter,
+    patient_writer: LiveCsvWriter,
+    results: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+    result_lock: threading.Lock,
+    rule_concurrency: int,
+    circuit: FailureCircuitBreaker,
+    run_metrics: dict[str, int] | None = None,
+    metrics_lock: threading.Lock | None = None,
+    stability_timer: RunStabilityTimer | None = None,
+    optimization_cfg: dict[str, Any] | None = None,
+    root: Path | None = None,
+    prebuilt_optimized_batches: list[list[JudgmentUnit]] | None = None,
+) -> dict[str, Any]:
+    optimization_cfg = optimization_cfg or {}
+    root = root or Path(__file__).resolve().parents[1]
+    try:
+        patient = load_patient(patient_file)
+    except Exception as exc:
+        patient_sn = patient_file.stem
+        failure = {"patient_sn": patient_sn, "patient_file": str(patient_file), "trial_id": "", "standard_no": "", "rule_type": "", "error": f"load_patient: {exc}", "run_id": run_id}
+        checkpoint.mark_patient(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), 0)
+        with result_lock:
+            failures.append(failure)
+        failure_writer.append(failure)
+        patient_writer.append(_patient_status_row(patient_sn, str(patient_file), "failed", len(rules), 0, len(rules), str(exc), run_id, 0))
+        return failure
+
+    patient_started = time.time()
+    checkpoint.mark_patient(patient.patient_sn, patient.source_file, "running", len(rules), 0, 0)
+    done_count = 0
+    failed_count = 0
+    last_error = ""
+    if prebuilt_optimized_batches is None:
+        reviewed_path = resolve_path(root, optimization_cfg.get("reviewed_groups_file", "config/reviewed_equivalent_rules.json"))
+        units = build_judgment_units(
+            rules,
+            merge_exact_duplicates=bool(optimization_cfg.get("merge_exact_duplicates", True)),
+            reviewed_groups_path=reviewed_path,
+            use_reviewed_equivalent_groups=bool(
+                optimization_cfg.get("use_reviewed_equivalent_groups", False)
+            ),
+        )
+        effective_max_rules = effective_batch_rule_limit(
+            configured_max_rules=int(optimization_cfg.get("max_batch_rules", labeling_cfg.get("llm_batch_size", 8)) or 8),
+            model_max_tokens=client.config.max_tokens,
+            estimated_output_tokens_per_rule=int(optimization_cfg.get("estimated_output_tokens_per_rule", 110) or 110),
+            output_token_reserve=int(optimization_cfg.get("output_token_reserve", 128) or 128),
+        )
+        prebuilt_optimized_batches = build_optimized_batches(
+            units,
+            max_rules=effective_max_rules,
+            max_rule_chars=int(optimization_cfg.get("max_batch_rule_chars", 3000) or 3000),
+            max_complex_rules=int(optimization_cfg.get("max_complex_batch_rules", 3) or 3),
+            max_simple_rules=int(optimization_cfg.get("max_simple_batch_rules", effective_max_rules) or effective_max_rules),
+            max_normal_rules=int(optimization_cfg.get("max_normal_batch_rules", effective_max_rules) or effective_max_rules),
+            complexity_budget=int(optimization_cfg.get("batch_complexity_budget", 12) or 12),
+        )
+        validate_optimization_plan(rules, units, prebuilt_optimized_batches)
+    batches = _filter_pending_optimized_batches(
+        prebuilt_optimized_batches,
+        patient.patient_sn,
+        checkpoint,
+        resume=bool(run_cfg.get("resume", True)),
+    )
+    done_count = len(rules) - sum(len(unit.members) for batch in batches for unit in batch)
+
+    def run_unit(unit: JudgmentUnit) -> list[tuple[TrialRule, dict[str, Any]]]:
+        circuit.before_call()
+        _record_llm_call(run_metrics, metrics_lock)
+        try:
+            representative_row = label_one(client, template_path, patient, unit.representative, labeling_cfg, run_id)
+        except Exception as exc:
+            _record_llm_failure(run_metrics, metrics_lock, stability_timer)
+            circuit.record_failure(str(exc))
+            raise
+        _record_llm_success(run_metrics, metrics_lock, stability_timer)
+        circuit.record_success()
+        return [(member, clone_result_for_rule(representative_row, member)) for member in unit.members]
+
+    def run_batch(batch_units: list[JudgmentUnit]) -> list[tuple[TrialRule, dict[str, Any]]]:
+        circuit.before_call()
+        representatives = [unit.representative for unit in batch_units]
+        batch_retries = max(0, int(labeling_cfg.get("batch_retry_attempts", 1) or 0))
+        last_exc: Exception | None = None
+        for _attempt in range(batch_retries + 1):
+            _record_llm_call(run_metrics, metrics_lock)
+            try:
+                representative_rows = label_batch_optimized(client, template_path, patient, representatives, labeling_cfg, run_id)
+                _record_llm_success(run_metrics, metrics_lock, stability_timer)
+                circuit.record_success()
+                break
+            except Exception as exc:
+                _record_llm_failure(run_metrics, metrics_lock, stability_timer)
+                last_exc = exc
+                if _attempt < batch_retries:
+                    time.sleep(min(8, 2 ** _attempt))
+                    continue
+                _increment_metric(run_metrics, metrics_lock, "optimized_batch_failures")
+                circuit.record_failure(str(exc))
+                raise
+        else:
+            raise last_exc or RuntimeError("optimized batch failed")
+        expanded: list[tuple[TrialRule, dict[str, Any]]] = []
+        for unit, representative_row in zip(batch_units, representative_rows):
+            expanded.extend((member, clone_result_for_rule(representative_row, member)) for member in unit.members)
+        return expanded
+
+    def write_success(rule: TrialRule, row: dict[str, Any]) -> None:
+        nonlocal done_count
+        with result_lock:
+            results.append(row)
+        result_writer.append(row)
+        checkpoint.mark_task(patient.patient_sn, rule.trial_id, rule.standard_no, "done")
+        done_count += 1
+
+    def write_failure(rule: TrialRule, exc: Exception) -> None:
+        nonlocal failed_count, last_error
+        failed_count += 1
+        last_error = str(exc)
+        checkpoint.mark_task(patient.patient_sn, rule.trial_id, rule.standard_no, "failed", last_error)
+        failure = {
+            "patient_sn": patient.patient_sn,
+            "patient_file": patient.source_file,
+            "trial_id": rule.trial_id,
+            "standard_no": rule.standard_no,
+            "rule_type": rule.rule_type,
+            "error": last_error,
+            "run_id": run_id,
+        }
+        with result_lock:
+            failures.append(failure)
+        failure_writer.append(failure)
+
+    def fallback_batch(batch_units: list[JudgmentUnit], batch_error: Exception) -> None:
+        nonlocal last_error
+        if circuit.is_open():
+            for unit in batch_units:
+                for member in unit.members:
+                    write_failure(member, batch_error)
+            return
+        if len(batch_units) == 1:
+            _increment_metric(run_metrics, metrics_lock, "optimized_unit_fallbacks")
+            unit = batch_units[0]
+            try:
+                for member, row in run_unit(unit):
+                    write_success(member, row)
+            except Exception as exc:
+                for member in unit.members:
+                    write_failure(member, exc)
+            return
+        midpoint = len(batch_units) // 2
+        _increment_metric(run_metrics, metrics_lock, "optimized_fallback_splits")
+        for half in (batch_units[:midpoint], batch_units[midpoint:]):
+            if not half:
+                continue
+            try:
+                for member, row in run_batch(half):
+                    write_success(member, row)
+            except Exception as exc:
+                fallback_batch(half, exc)
+            if circuit.is_open():
+                last_error = circuit.reason
+                return
+
+    batch_iter = iter(batches)
+    futures: dict[Any, list[JudgmentUnit]] = {}
+
+    def submit_more(pool: ThreadPoolExecutor) -> None:
+        while len(futures) < rule_concurrency and not circuit.is_open():
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                return
+            futures[pool.submit(run_batch, batch)] = batch
+
+    if rule_concurrency <= 1:
+        for batch in batches:
+            if circuit.is_open():
+                last_error = circuit.reason
+                break
+            try:
+                for member, row in run_batch(batch):
+                    write_success(member, row)
+            except Exception as exc:
+                fallback_batch(batch, exc)
+    else:
+        with ThreadPoolExecutor(max_workers=rule_concurrency) as pool:
+            submit_more(pool)
+            while futures:
+                for future in as_completed(list(futures.keys())):
+                    batch = futures.pop(future)
+                    try:
+                        for member, row in future.result():
+                            write_success(member, row)
+                    except Exception as exc:
+                        fallback_batch(batch, exc)
+                    break
+                submit_more(pool)
+        if circuit.is_open() and not last_error:
+            last_error = circuit.reason
+
+    if failed_count == 0 and done_count >= len(rules):
+        status = "done"
+    elif done_count > 0 or failed_count > 0:
+        status = "partial"
+    else:
+        status = "failed"
+    patient_elapsed = time.time() - patient_started
+    checkpoint.mark_patient(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, patient_elapsed)
+    status_row = _patient_status_row(patient.patient_sn, patient.source_file, status, len(rules), done_count, failed_count, last_error, run_id, patient_elapsed)
     patient_writer.append(status_row)
     return status_row
 
@@ -556,6 +1129,51 @@ def label_batch(client: LLMClient, template_path: Path, patient: PatientRecord, 
     return rows
 
 
+def label_batch_optimized(
+    client: LLMClient,
+    template_path: Path,
+    patient: PatientRecord,
+    rules: list[TrialRule],
+    labeling_cfg: dict[str, Any],
+    run_id: str,
+) -> list[dict[str, Any]]:
+    prepared = []
+    profiles = {}
+    evidences = {}
+    evidence_cache = {}
+    for rule in rules:
+        profile = classify_rule(rule)
+        evidence = evidence_cache.get(profile.category)
+        if evidence is None:
+            evidence = build_evidence(
+                patient,
+                rule,
+                profile,
+                max_section_chars=int(labeling_cfg.get("max_evidence_chars_per_section", 3500)),
+                max_total_chars=int(labeling_cfg.get("max_total_evidence_chars", 16000)),
+            )
+            evidence_cache[profile.category] = evidence
+        prepared.append((rule, evidence))
+        profiles[(rule.trial_id, rule.standard_no)] = profile
+        evidences[(rule.trial_id, rule.standard_no)] = evidence
+
+    prompt = build_optimized_batch_prompt(
+        template_path,
+        patient.patient_sn,
+        prepared,
+        use_compact_template=bool(labeling_cfg.get("use_compact_prompt", True)),
+    )
+    normalized_items = normalize_llm_batch_result_strict(client.label(prompt), rules)
+    rows = []
+    for rule, normalized in zip(rules, normalized_items):
+        profile = profiles[(rule.trial_id, rule.standard_no)]
+        evidence = evidences[(rule.trial_id, rule.standard_no)]
+        if bool(labeling_cfg.get("apply_missing_policy", True)):
+            normalized = apply_missing_policy(normalized, rule, profile)
+        rows.append(build_result_row(patient, rule, profile.category, evidence, normalized, run_id))
+    return rows
+
+
 def build_result_row(
     patient: PatientRecord,
     rule: TrialRule,
@@ -584,6 +1202,20 @@ def build_result_row(
     }
 
 
+def clone_result_for_rule(row: dict[str, Any], rule: TrialRule) -> dict[str, Any]:
+    cloned = dict(row)
+    cloned.update(
+        {
+            "试验注册号": rule.trial_register_id,
+            "试验标识": rule.trial_id,
+            "标准编号": rule.standard_no,
+            "规则标识": rule.rule_type,
+            "标准内容": rule.rule_text,
+        }
+    )
+    return cloned
+
+
 def chunked(items: list[TrialRule], size: int) -> list[list[TrialRule]]:
     size = max(1, int(size or 1))
     return [items[idx:idx + size] for idx in range(0, len(items), size)]
@@ -600,7 +1232,43 @@ def group_rules_for_batches(rules: list[TrialRule], size: int) -> list[list[Tria
     return batches
 
 
-def _patient_status_row(patient_sn: str, source_file: str, status: str, total_rules: int, done_rules: int, failed_rules: int, last_error: str, run_id: str) -> dict[str, Any]:
+def _filter_pending_optimized_batches(
+    batches: list[list[JudgmentUnit]],
+    patient_sn: str,
+    checkpoint: Checkpoint,
+    resume: bool,
+) -> list[list[JudgmentUnit]]:
+    if not resume:
+        return batches
+    pending_batches: list[list[JudgmentUnit]] = []
+    for batch in batches:
+        pending_units: list[JudgmentUnit] = []
+        for unit in batch:
+            pending_members = tuple(
+                member
+                for member in unit.members
+                if not checkpoint.done(patient_sn, member.trial_id, member.standard_no)
+            )
+            if not pending_members:
+                continue
+            if len(pending_members) == len(unit.members):
+                pending_units.append(unit)
+            else:
+                pending_units.append(
+                    JudgmentUnit(
+                        canonical_rule_id=unit.canonical_rule_id,
+                        representative=pending_members[0],
+                        members=pending_members,
+                        signature=unit.signature,
+                        merge_type=unit.merge_type,
+                    )
+                )
+        if pending_units:
+            pending_batches.append(pending_units)
+    return pending_batches
+
+
+def _patient_status_row(patient_sn: str, source_file: str, status: str, total_rules: int, done_rules: int, failed_rules: int, last_error: str, run_id: str, elapsed_seconds: float = 0) -> dict[str, Any]:
     return {
         "patient_sn": patient_sn,
         "source_file": source_file,
@@ -610,6 +1278,7 @@ def _patient_status_row(patient_sn: str, source_file: str, status: str, total_ru
         "failed_rules": failed_rules,
         "last_error": last_error,
         "run_id": run_id,
+        "elapsed_seconds": round(float(elapsed_seconds or 0), 3),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -676,6 +1345,84 @@ def estimate_days(elapsed: float, processed_patients: int, target_patients: int)
     return round((elapsed / processed_patients * target_patients) / 86400, 2)
 
 
+def summarize_llm_usage(path: Path) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "path": str(path),
+        "rows": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 0,
+        "prompt_cache_hit_ratio": None,
+        "models": {},
+    }
+    if not path.exists():
+        return summary
+    model_counts: dict[str, int] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            summary["rows"] += 1
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+            ):
+                summary[key] += int(row.get(key) or 0)
+            model = str(row.get("model") or "")
+            if model:
+                model_counts[model] = model_counts.get(model, 0) + 1
+    cache_total = summary["prompt_cache_hit_tokens"] + summary["prompt_cache_miss_tokens"]
+    if cache_total > 0:
+        summary["prompt_cache_hit_ratio"] = round(summary["prompt_cache_hit_tokens"] / cache_total, 6)
+    summary["models"] = model_counts
+    return summary
+
+
+def build_patient_timing_summary(
+    elapsed: float,
+    patient_rows: list[dict[str, Any]],
+    total_patients: int,
+    allowed_patient_sns: set[str] | None = None,
+) -> dict[str, Any]:
+    original_patient_rows = list(patient_rows)
+    if allowed_patient_sns is not None:
+        patient_rows = [row for row in patient_rows if str(row.get("patient_sn")) in allowed_patient_sns]
+        if not patient_rows and original_patient_rows:
+            patient_rows = original_patient_rows
+    observed_rows = [
+        row
+        for row in patient_rows
+        if str(row.get("status")) in {"done", "partial", "failed"} and float(row.get("elapsed_seconds") or 0) > 0
+    ]
+    done_rows = [
+        row
+        for row in patient_rows
+        if str(row.get("status")) == "done" and float(row.get("elapsed_seconds") or 0) > 0
+    ]
+    observed_total = sum(float(row.get("elapsed_seconds") or 0) for row in observed_rows)
+    done_total = sum(float(row.get("elapsed_seconds") or 0) for row in done_rows)
+    return {
+        "total_wall_seconds": round(elapsed, 2),
+        "total_patients": int(total_patients),
+        "observed_patient_count": len(observed_rows),
+        "done_patient_count": len(done_rows),
+        "avg_wall_seconds_per_patient": round(elapsed / total_patients, 2) if total_patients else 0,
+        "avg_pure_patient_seconds_observed": round(observed_total / len(observed_rows), 2) if observed_rows else 0,
+        "avg_pure_patient_seconds_done": round(done_total / len(done_rows), 2) if done_rows else 0,
+        "pure_patient_seconds_total_observed": round(observed_total, 2),
+    }
+
+
 def validate_model_config(provider: str, base_url: str, model_name: str, api_key: str, model_path: str = "") -> list[str]:
     errors: list[str] = []
     placeholder_markers = ["替换", "服务器C地址", "API key", "实际模型名", "your", "xxx"]
@@ -709,6 +1456,36 @@ def _mask_secret(value: str) -> str:
     if len(value) <= 8:
         return "***"
     return value[:4] + "***" + value[-4:]
+
+
+def _record_llm_call(run_metrics: dict[str, int] | None, lock: threading.Lock | None) -> None:
+    _increment_metric(run_metrics, lock, "llm_calls")
+
+
+def _record_llm_success(run_metrics: dict[str, int] | None, lock: threading.Lock | None, stability_timer: RunStabilityTimer | None) -> None:
+    _increment_metric(run_metrics, lock, "llm_call_successes")
+    if stability_timer is not None:
+        stability_timer.record_success()
+
+
+def _record_llm_failure(run_metrics: dict[str, int] | None, lock: threading.Lock | None, stability_timer: RunStabilityTimer | None) -> None:
+    _increment_metric(run_metrics, lock, "llm_call_failures")
+    if stability_timer is not None:
+        stability_timer.record_failure()
+
+
+def _increment_metric(
+    run_metrics: dict[str, int] | None,
+    lock: threading.Lock | None,
+    name: str,
+) -> None:
+    if run_metrics is None:
+        return
+    if lock is None:
+        run_metrics[name] = int(run_metrics.get(name, 0)) + 1
+        return
+    with lock:
+        run_metrics[name] = int(run_metrics.get(name, 0)) + 1
 
 
 if __name__ == "__main__":

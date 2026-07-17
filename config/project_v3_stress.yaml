@@ -1,0 +1,52 @@
+# V3 standard-layer stress test only. It never writes annotation results.
+paths:
+  patient_dir: "../patientTestDeepseek"
+  rules_file: "data/input/rules_v3_standard.xlsx"
+  output_dir: "data/output_v3_stress"
+
+model:
+  config_file: "config/model_api_v3.yaml"
+  timeout_seconds: 60
+  max_retries: 1
+  max_tokens: 1024
+  enable_thinking: false
+
+sampling:
+  patient_count: 2
+  batch_count: 12
+  requests_per_level: 12
+  warmup_requests: 1
+  cooldown_seconds: 8
+
+guardrails:
+  failure_threshold: 0.10
+  max_p95_latency_seconds: 45
+  max_timeout_like_failures: 1
+
+# These candidates are intentionally below the V2 batch-6/8 stress boundary.
+# V3 rules carry explicit time anchors and finer missing-evidence logic.
+strategies:
+  conservative:
+    concurrency_levels: "1,2"
+    max_batch_rules: 2
+    max_simple_batch_rules: 2
+    max_normal_batch_rules: 2
+    max_complex_batch_rules: 1
+    batch_complexity_budget: 7
+    max_batch_rule_chars: 2500
+  balanced:
+    concurrency_levels: "1,2"
+    max_batch_rules: 3
+    max_simple_batch_rules: 3
+    max_normal_batch_rules: 3
+    max_complex_batch_rules: 2
+    batch_complexity_budget: 10
+    max_batch_rule_chars: 3500
+  upper_bound:
+    concurrency_levels: "1,2"
+    max_batch_rules: 4
+    max_simple_batch_rules: 4
+    max_normal_batch_rules: 3
+    max_complex_batch_rules: 2
+    batch_complexity_budget: 12
+    max_batch_rule_chars: 4500

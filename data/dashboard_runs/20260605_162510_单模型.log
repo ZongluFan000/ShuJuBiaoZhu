@@ -1,5 +1,0 @@
-[dashboard] started_at=2026-06-05T16:25:10
-[dashboard] project_config=project_full_ai_only.yaml model_config=model_api.yaml
-[dashboard] command=C:\Users\29812\Desktop\鏁版嵁鏍囨敞\annotation_sandbox_api_only\runtime\python\python.exe -u C:\Users\29812\Desktop\鏁版嵁鏍囨敞\annotation_sandbox_api_only\src\main.py --mode full --config C:\Users\29812\Desktop\鏁版嵁鏍囨敞\annotation_sandbox_api_only\config\project_full_ai_only.yaml --model-config C:\Users\29812\Desktop\鏁版嵁鏍囨敞\annotation_sandbox_api_only\config\model_api.yaml
-
-患者选择清单已启用: selected=1 total_available=100
