@@ -35,11 +35,29 @@ class Checkpoint:
               done_rules integer default 0,
               failed_rules integer default 0,
               last_error text default '',
+              started_at datetime default current_timestamp,
+              elapsed_seconds real default 0,
               updated_at datetime default current_timestamp
             )
             """
         )
+        self.conn.execute(
+            """
+            create table if not exists run_meta (
+              key text primary key,
+              value text not null
+            )
+            """
+        )
+        self._ensure_patient_status_columns()
         self.conn.commit()
+
+    def _ensure_patient_status_columns(self) -> None:
+        columns = {row[1] for row in self.conn.execute("pragma table_info(patient_status)").fetchall()}
+        if "started_at" not in columns:
+            self.conn.execute("alter table patient_status add column started_at datetime default ''")
+        if "elapsed_seconds" not in columns:
+            self.conn.execute("alter table patient_status add column elapsed_seconds real default 0")
 
     def done(self, patient_sn: str, trial_id: str, standard_no: str) -> bool:
         with self.lock:
@@ -65,6 +83,46 @@ class Checkpoint:
     def mark(self, patient_sn: str, trial_id: str, standard_no: str, status: str) -> None:
         self.mark_task(patient_sn, trial_id, standard_no, status)
 
+    def get_meta(self, key: str, default: str = "") -> str:
+        with self.lock:
+            row = self.conn.execute("select value from run_meta where key=?", (key,)).fetchone()
+        return str(row[0]) if row else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                insert into run_meta(key, value) values (?, ?)
+                on conflict(key) do update set value=excluded.value
+                """,
+                (key, value),
+            )
+            self.conn.commit()
+
+    def has_started_work(self) -> bool:
+        with self.lock:
+            progress_count = self.conn.execute("select count(*) from progress").fetchone()[0]
+            patient_count = self.conn.execute("select count(*) from patient_status").fetchone()[0]
+        return bool(int(progress_count or 0) or int(patient_count or 0))
+
+    def has_incomplete_work(self) -> bool:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                select count(*) from progress
+                where status not in ('done', 'failed')
+                """
+            ).fetchone()
+            incomplete_progress = int(row[0] or 0)
+            row = self.conn.execute(
+                """
+                select count(*) from patient_status
+                where status in ('running', 'partial')
+                """
+            ).fetchone()
+            incomplete_patients = int(row[0] or 0)
+        return bool(incomplete_progress or incomplete_patients)
+
     def mark_patient(
         self,
         patient_sn: str,
@@ -74,12 +132,14 @@ class Checkpoint:
         done_rules: int,
         failed_rules: int,
         last_error: str = "",
+        elapsed_seconds: float | None = None,
     ) -> None:
+        elapsed_value = 0.0 if elapsed_seconds is None else round(float(elapsed_seconds), 3)
         with self.lock:
             self.conn.execute(
                 """
-                insert into patient_status(patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                insert into patient_status(patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error, started_at, elapsed_seconds, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, current_timestamp, ?, current_timestamp)
                 on conflict(patient_sn)
                 do update set source_file=excluded.source_file,
                               status=excluded.status,
@@ -87,9 +147,11 @@ class Checkpoint:
                               done_rules=excluded.done_rules,
                               failed_rules=excluded.failed_rules,
                               last_error=excluded.last_error,
+                              started_at=case when excluded.status='running' then current_timestamp else patient_status.started_at end,
+                              elapsed_seconds=case when excluded.status='running' then 0 else excluded.elapsed_seconds end,
                               updated_at=current_timestamp
                 """,
-                (patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error[:1000]),
+                (patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error[:1000], elapsed_value),
             )
             self.conn.commit()
 
@@ -115,6 +177,38 @@ class Checkpoint:
             ).fetchall()
         return {str(patient_sn): str(source_file) for patient_sn, source_file in rows if source_file}
 
+    def recover_running_patients(self) -> int:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                select patient_sn, total_rules, done_rules, failed_rules
+                from patient_status
+                where status='running'
+                """
+            ).fetchall()
+            changed = 0
+            for patient_sn, total_rules, done_rules, failed_rules in rows:
+                done = int(done_rules or 0)
+                failed = int(failed_rules or 0)
+                total = int(total_rules or 0)
+                if total and done >= total and failed == 0:
+                    status = "done"
+                elif done > 0 or failed > 0:
+                    status = "partial"
+                else:
+                    status = "failed"
+                self.conn.execute(
+                    """
+                    update patient_status
+                    set status=?, last_error=?, updated_at=current_timestamp
+                    where patient_sn=? and status='running'
+                    """,
+                    (status, "recovered stale running status at startup", patient_sn),
+                )
+                changed += 1
+            self.conn.commit()
+        return changed
+
     def task_status_counts(self) -> dict[str, int]:
         with self.lock:
             rows = self.conn.execute("select status, count(*) from progress group by status").fetchall()
@@ -124,12 +218,12 @@ class Checkpoint:
         with self.lock:
             rows = self.conn.execute(
                 """
-                select patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error, updated_at
+                select patient_sn, source_file, status, total_rules, done_rules, failed_rules, last_error, updated_at, elapsed_seconds, started_at
                 from patient_status
                 order by updated_at desc
                 """
             ).fetchall()
-        keys = ["patient_sn", "source_file", "status", "total_rules", "done_rules", "failed_rules", "last_error", "updated_at"]
+        keys = ["patient_sn", "source_file", "status", "total_rules", "done_rules", "failed_rules", "last_error", "updated_at", "elapsed_seconds", "started_at"]
         return [dict(zip(keys, row)) for row in rows]
 
     def failed_task_rows(self) -> list[dict[str, Any]]:
@@ -144,3 +238,7 @@ class Checkpoint:
             ).fetchall()
         keys = ["patient_sn", "trial_id", "standard_no", "status", "error", "updated_at"]
         return [dict(zip(keys, row)) for row in rows]
+
+    def close(self) -> None:
+        with self.lock:
+            self.conn.close()

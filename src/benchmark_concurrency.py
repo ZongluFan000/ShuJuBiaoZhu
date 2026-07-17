@@ -39,7 +39,7 @@ REALISH_PROMPT = """你是临床试验入排标准标注助手。请根据患者
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark model API concurrency.")
-    parser.add_argument("--model-config", default="config/model_api.yaml")
+    parser.add_argument("--model-config", default="config/model_api.example.yaml")
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--requests", type=int, default=20)
     parser.add_argument("--prompt-mode", choices=["short", "realish"], default="short")

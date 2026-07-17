@@ -1,0 +1,11 @@
+provider: "openai_compatible"
+base_url: "https://api.deepseek.com"
+api_key: "replace-with-your-api-key"
+model_name: "deepseek-v4-flash"
+timeout_seconds: 60
+max_retries: 1
+temperature: 0.0
+max_tokens: 1024
+stream: false
+enable_thinking: false
+json_mode: true

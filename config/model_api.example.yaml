@@ -1,0 +1,11 @@
+provider: "openai_compatible"
+base_url: "http://10.207.23.46:8001/v1"
+api_key: ""
+model_name: "/model/Qwen3-32B/"
+timeout_seconds: 180
+max_retries: 2
+concurrency: 20
+temperature: 0.0
+max_tokens: 512
+stream: false
+enable_thinking: false

@@ -1,0 +1,46 @@
+paths:
+  patient_dir: "../patientTestDeepseek"
+  rules_file: "data/input/rules_v3_standard.xlsx"
+  prompt_template: "config/prompt_templates/label_rules_v3.md"
+  output_dir: "data/output_v3_first_patient_test"
+  log_dir: "data/logs_v3_first_patient_test"
+  checkpoint_db: "data/checkpoint_v3_first_patient_test/progress.sqlite"
+
+run:
+  mode: "test"
+  concurrency: 1
+  rule_concurrency: 12
+  resume: false
+  write_xlsx: false
+  model_preflight: true
+  max_consecutive_llm_failures: 5
+  soft_circuit_recovery: true
+  soft_circuit_cooldown_seconds: 90
+  soft_circuit_max_rounds: 3
+  recover_stale_running: true
+
+labeling:
+  use_structured_judge: false
+  apply_missing_policy: true
+  group_rules_for_llm: true
+  use_compact_prompt: true
+  llm_batch_size: 3
+  max_evidence_chars_per_section: 600
+  max_total_evidence_chars: 2200
+  batch_retry_attempts: 1
+
+optimization:
+  enabled: true
+  use_fixed_batch_plan: true
+  batch_plan_file: "data/rule_batch_plan_v3_first_patient_test.json"
+  merge_exact_duplicates: false
+  use_reviewed_equivalent_groups: false
+  reviewed_groups_file: "config/reviewed_equivalent_rules.json"
+  max_batch_rules: 3
+  max_simple_batch_rules: 3
+  max_normal_batch_rules: 3
+  max_complex_batch_rules: 2
+  batch_complexity_budget: 10
+  max_batch_rule_chars: 3500
+  estimated_output_tokens_per_rule: 90
+  output_token_reserve: 128

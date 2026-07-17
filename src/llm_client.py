@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from typing import Any
 import time
+import threading
 import urllib.error
 import urllib.request
+
+
+_USAGE_LOG_LOCK = threading.Lock()
 
 
 @dataclass
@@ -20,7 +26,9 @@ class LLMConfig:
     max_retries: int = 2
     temperature: float = 0.0
     max_tokens: int = 1024
+    stream: bool = False
     enable_thinking: bool | None = None
+    json_mode: bool = False
     torch_dtype: str = "float16"
     device_map: str = "auto"
     max_memory_gpu: str = ""
@@ -75,33 +83,181 @@ class LLMClient:
         }
 
     def _call_api(self, prompt: str) -> dict[str, Any]:
-        url = self.config.base_url.rstrip("/") + "/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        messages = [{"role": "user", "content": prompt}]
+        if self.config.json_mode:
+            messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": "只返回一个合法 JSON 对象。禁止输出分析过程、Markdown 或 JSON 以外的任何字符。",
+                },
+            )
         payload = {
             "model": self.config.model_name,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
+            "stream": self.config.stream,
         }
+        if self.config.json_mode:
+            payload["response_format"] = {"type": "json_object"}
         if self.config.upstream_url:
             payload["apiUrl"] = self.config.upstream_url
         if self.config.enable_thinking is not None:
             payload["chat_template_kwargs"] = {"enable_thinking": self.config.enable_thinking}
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         last_error: Exception | None = None
         for attempt in range(max(1, self.config.max_retries)):
             try:
-                req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                content = _extract_assistant_text(data)
-                return _parse_json_content(content)
+                content = self._request_api_content(payload)
+                try:
+                    return _parse_json_content(content)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    if not self.config.stream:
+                        try:
+                            return self._repair_json_output(content, prompt, exc)
+                        except Exception as repair_exc:
+                            snippet = content.strip().replace("\r", " ").replace("\n", " ")[:800]
+                            raise ValueError(
+                                f"LLM returned non-JSON output: {exc}; repair_failed={repair_exc}; content_snippet={snippet!r}"
+                            ) from exc
+                    snippet = content.strip().replace("\r", " ").replace("\n", " ")[:800]
+                    raise ValueError(f"LLM returned non-JSON output: {exc}; content_snippet={snippet!r}") from exc
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 last_error = exc
                 time.sleep(min(20, 2**attempt))
         raise RuntimeError(f"LLM API call failed: {last_error}")
+
+    def _request_api_content(self, payload: dict[str, Any]) -> str:
+        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with _direct_urlopen(req, timeout=self.config.timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            error_body = _read_http_error_body(exc)
+            raise urllib.error.HTTPError(
+                exc.url,
+                exc.code,
+                f"{exc.reason}; response_body={error_body!r}",
+                exc.headers,
+                exc.fp,
+            ) from exc
+        if self.config.stream:
+            return _extract_streaming_text(raw)
+        data = json.loads(raw)
+        _write_usage_log(data, payload)
+        return _extract_assistant_text(data)
+
+    def _repair_json_output(self, content: str, original_prompt: str, original_error: Exception) -> dict[str, Any]:
+        if "{" not in content or "}" not in content:
+            raise ValueError("repair skipped because output contains no JSON-like object")
+        repair_prompt = (
+            "请把下面模型输出修复为一个合法 JSON 对象。不要重新判断医学含义，不要添加解释文字，"
+            "只保留或补齐 JSON 结构。目标格式必须是："
+            "{\"items\":[{\"trial_id\":\"\",\"standard_no\":\"\",\"label\":\"符合/不符合/未知\","
+            "\"explanation\":\"\",\"evidence\":\"\",\"confidence\":0.0}]}。\n\n"
+            f"原始解析错误：{original_error}\n\n"
+            f"原始输出：\n{content[:8000]}\n\n"
+            f"原始任务提示片段：\n{original_prompt[:2000]}"
+        )
+        payload = {
+            "model": self.config.model_name,
+            "messages": [{"role": "user", "content": repair_prompt}],
+            "temperature": 0.0,
+            "max_tokens": min(max(int(self.config.max_tokens or 1024), 512), 2048),
+            "stream": False,
+        }
+        if self.config.upstream_url:
+            payload["apiUrl"] = self.config.upstream_url
+        if self.config.enable_thinking is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        repaired = self._request_api_content(payload)
+        return _parse_json_content(repaired)
+
+
+def _direct_urlopen(req: urllib.request.Request, timeout: int):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(req, timeout=timeout)
+
+
+def _read_http_error_body(exc: urllib.error.HTTPError, limit: int = 2000) -> str:
+    try:
+        raw = exc.read(limit)
+    except Exception as read_exc:
+        return f"<failed to read response body: {read_exc}>"
+    if not raw:
+        return ""
+    return raw.decode("utf-8", errors="replace").replace("\r", " ").replace("\n", " ")
+
+
+def _write_usage_log(response_data: Any, payload: dict[str, Any]) -> None:
+    log_path = os.getenv("LLM_USAGE_LOG_FILE", "").strip()
+    if not log_path or not isinstance(response_data, dict):
+        return
+    usage = response_data.get("usage")
+    if not isinstance(usage, dict):
+        return
+    messages = payload.get("messages", [])
+    prompt_chars = 0
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict):
+                prompt_chars += len(str(message.get("content") or ""))
+    row = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "run_id": os.getenv("LLM_RUN_ID", ""),
+        "model": payload.get("model", ""),
+        "response_id": response_data.get("id", ""),
+        "prompt_chars": prompt_chars,
+        "completion_chars": len(_safe_assistant_text(response_data)),
+        "usage": usage,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "prompt_cache_hit_tokens": usage.get("prompt_cache_hit_tokens"),
+        "prompt_cache_miss_tokens": usage.get("prompt_cache_miss_tokens"),
+    }
+    directory = os.path.dirname(log_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with _USAGE_LOG_LOCK:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _safe_assistant_text(data: Any) -> str:
+    try:
+        return _extract_assistant_text(data)
+    except Exception:
+        return ""
+
+
+def _extract_streaming_text(raw: str) -> str:
+    parts: list[str] = []
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith("data:"):
+            text = text[5:].strip()
+        if not text or text == "[DONE]":
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            parts.append(text)
+            continue
+        try:
+            chunk = _extract_assistant_text(data)
+        except ValueError:
+            chunk = ""
+        if chunk:
+            parts.append(chunk)
+    return "".join(parts).strip()
 
 
 def _extract_assistant_text(data: Any) -> str:
@@ -125,6 +281,10 @@ def _extract_assistant_text(data: Any) -> str:
             text = _first_text(
                 message.get("content") if isinstance(message, dict) else message,
                 delta.get("content") if isinstance(delta, dict) else delta,
+                message.get("reasoning_content") if isinstance(message, dict) else "",
+                delta.get("reasoning_content") if isinstance(delta, dict) else "",
+                message.get("reasoning") if isinstance(message, dict) else "",
+                delta.get("reasoning") if isinstance(delta, dict) else "",
                 choice.get("text"),
                 choice.get("content"),
             )
@@ -152,7 +312,12 @@ def _extract_assistant_text(data: Any) -> str:
 
     message = data.get("message")
     if isinstance(message, dict):
-        text = _first_text(message.get("content"), message.get("text"))
+        text = _first_text(
+            message.get("content"),
+            message.get("text"),
+            message.get("reasoning_content"),
+            message.get("reasoning"),
+        )
         if text:
             return text
 
@@ -213,9 +378,9 @@ def _stringify_content(value: Any) -> str:
 
 
 def _parse_json_content(content: str) -> dict[str, Any]:
-    text = content.strip()
-    if "</think>" in text:
-        text = text.split("</think>", 1)[1].strip()
+    text = _strip_thinking_text(content).strip()
+    if not text:
+        raise ValueError("empty assistant content after removing thinking text")
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -224,7 +389,19 @@ def _parse_json_content(content: str) -> dict[str, Any]:
     end = text.rfind("}")
     if start >= 0 and end >= start:
         text = text[start : end + 1]
+    elif not text.startswith("{"):
+        raise ValueError(f"assistant content does not contain a JSON object: {text[:120]!r}")
     return json.loads(text)
+
+
+def _strip_thinking_text(text: str) -> str:
+    value = (text or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"(?is)<think>.*?</think>", "", value).strip()
+    if "</think>" in value:
+        value = value.split("</think>", 1)[1].strip()
+    return value
 
 
 def _load_transformers_model(config: LLMConfig):
