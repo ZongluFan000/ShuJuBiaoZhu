@@ -24,7 +24,7 @@ from validator import normalize_llm_batch_result_strict
 
 class RuleOptimizerTests(unittest.TestCase):
     def test_all_original_rules_are_preserved_as_members(self) -> None:
-        rules = load_rules(ROOT / "data" / "input" / "rules.xlsx")
+        rules = load_rules(ROOT / "data" / "input" / "rules_v3_standard.xlsx")
         units = build_judgment_units(
             rules,
             merge_exact_duplicates=True,
@@ -148,8 +148,8 @@ class RuleOptimizerTests(unittest.TestCase):
             [(rule, evidence)],
         )
         compact_section = prompt.split("严格独立判断要求：", 1)[1]
-        self.assertIn('"trial_id":"..."', compact_section)
-        self.assertIn("不要返回 trial_register_id", compact_section)
+        self.assertIn('{"i":[{"n":1,"l":"Y/N/U"', compact_section)
+        self.assertIn("只能用R号对齐结果", compact_section)
         self.assertNotIn('"trial_register_id": "..."', prompt)
 
     def test_similarity_aware_batching_places_related_rules_together(self) -> None:

@@ -17,6 +17,7 @@ def export_outputs(
     write_xlsx: bool = True,
     patient_rows: list[dict[str, Any]] | None = None,
     failed_task_rows: list[dict[str, Any]] | None = None,
+    trial_summaries: list[dict[str, Any]] | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     suffix = ""
@@ -32,6 +33,8 @@ def export_outputs(
         _write_csv(_safe_path(output_dir / "failed_patients.csv", suffix), failed_patients)
     if failed_task_rows is not None:
         _write_csv(_safe_path(output_dir / "failed_tasks_from_checkpoint.csv", suffix), failed_task_rows)
+    if trial_summaries is not None:
+        _write_csv(_safe_path(output_dir / "trial_summary.csv", suffix), trial_summaries)
     trace_cols = ["患者编号", "试验注册号", "试验标识", "标准编号", "证据来源", "参考原始病历信息"]
     traces = [{k: row.get(k, "") for k in trace_cols} for row in results]
     _write_csv(_safe_path(output_dir / "evidence_trace.csv", suffix), traces)
@@ -42,6 +45,8 @@ def export_outputs(
         }
         if patient_rows is not None:
             sheets["patient_status"] = patient_rows
+        if trial_summaries is not None:
+            sheets["trial_summary"] = trial_summaries
         try:
             _write_xlsx(_safe_path(output_dir / "annotation_results.xlsx", suffix), sheets)
         except PermissionError:

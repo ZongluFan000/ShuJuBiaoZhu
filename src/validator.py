@@ -5,16 +5,16 @@ from typing import Any
 from load_rules import TrialRule
 from rule_classifier import RuleProfile
 
-ALLOWED_LABELS = {"符合", "不符合", "未知"}
+ALLOWED_LABELS = {"满足", "不满足", "未知"}
 LABEL_ALIASES = {
-    "Y": "符合",
-    "YES": "符合",
-    "TRUE": "符合",
-    "符合": "符合",
-    "N": "不符合",
-    "NO": "不符合",
-    "FALSE": "不符合",
-    "不符合": "不符合",
+    "Y": "满足",
+    "YES": "满足",
+    "TRUE": "满足",
+    "满足": "满足",
+    "N": "不满足",
+    "NO": "不满足",
+    "FALSE": "不满足",
+    "不满足": "不满足",
     "U": "未知",
     "UNK": "未知",
     "UNKNOWN": "未知",
@@ -174,12 +174,10 @@ def apply_missing_policy(result: dict[str, Any], rule: TrialRule, profile: RuleP
     original_label = result["label"]
     new_label = original_label
 
-    if "入选" in rule.rule_type:
+    # V4 scheme: no relevant evidence always means unknown, regardless of
+    # inclusion/exclusion type or evidence category.
+    if any(keyword in text for keyword in MISSING_KEYWORDS):
         new_label = "未知"
-    elif profile.category == "lab":
-        new_label = "未知"
-    elif profile.category in {"history", "treatment"}:
-        new_label = "符合"
 
     if new_label != original_label:
         result = dict(result)
