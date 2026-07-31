@@ -6,6 +6,7 @@ import re
 
 from evidence_builder import EvidencePackage
 from load_rules import TrialRule
+from time_anchor import time_anchor_prompt
 
 
 @lru_cache(maxsize=8)
@@ -46,12 +47,14 @@ def _deduplicated_evidence_block(evidences: list[tuple[int, EvidencePackage]]) -
     return "证据引用：" + "；".join(refs) + "\n证据正文：\n" + "\n".join(evidence_lines)
 
 
-def build_prompt(template_path: Path, patient_sn: str, rule: TrialRule, evidence: EvidencePackage) -> str:
+def build_prompt(template_path: Path, patient_sn: str, rule: TrialRule, evidence: EvidencePackage, time_anchor: dict[str, str] | None = None) -> str:
     template = _read_template(str(template_path))
     return (
         template
         + "\n\n患者编号：\n"
         + patient_sn
+        + "\n\n"
+        + time_anchor_prompt(time_anchor or {})
         + "\n\n待判断标准：\n"
         + f"试验注册号：{rule.trial_register_id}\n"
         + f"试验标识：{rule.trial_id}\n"
@@ -63,7 +66,7 @@ def build_prompt(template_path: Path, patient_sn: str, rule: TrialRule, evidence
     )
 
 
-def build_batch_prompt(template_path: Path, patient_sn: str, items: list[tuple[TrialRule, EvidencePackage]]) -> str:
+def build_batch_prompt(template_path: Path, patient_sn: str, items: list[tuple[TrialRule, EvidencePackage]], time_anchor: dict[str, str] | None = None) -> str:
     template = _read_template(str(template_path))
     shared_evidence = ""
     if items:
@@ -104,8 +107,13 @@ def build_optimized_batch_prompt(
     patient_sn: str,
     items: list[tuple[TrialRule, EvidencePackage]],
     use_compact_template: bool = True,
+    time_anchor: dict[str, str] | None = None,
 ) -> str:
-    compact_template_path = template_path.with_name("label_rules_compact.md")
+    compact_template_path = template_path.with_name(template_path.stem + "_compact.md")
+    if not compact_template_path.exists():
+        # Keep non-V4 utility callers working; V4 has its own paired compact
+        # template and therefore never reaches this compatibility fallback.
+        compact_template_path = template_path.with_name("label_rules_compact.md")
     selected_template_path = (
         compact_template_path
         if use_compact_template and compact_template_path.exists()
@@ -139,9 +147,11 @@ def build_optimized_batch_prompt(
         + "\n5. 只能返回一个合法JSON对象，不得输出Markdown、JSONL或额外说明。"
         + "\n6. 短JSON格式固定为："
         + '\n{"i":[{"n":1,"l":"Y/N/U","e":"证据<=20字","x":"解释<=40字","c":0.0}]}'
-        + "\n7. l取值：Y=符合，N=不符合，U=未知。n必须是输入R号里的数字。"
+        + "\n7. l取值：Y=满足，N=不满足，U=未知。n必须是输入R号里的数字。"
         + "\n\n患者编号：\n"
         + patient_sn
+        + "\n\n"
+        + time_anchor_prompt(time_anchor or {})
         + evidence_block
         # Keep the patient evidence before batch-specific rules so API prefix caching
         # can reuse the shared context across multiple batches for one patient.

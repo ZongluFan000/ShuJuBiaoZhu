@@ -33,6 +33,7 @@ from rule_optimizer import (
     validate_optimization_plan,
 )
 from structured_judge import try_structured_judge
+from trial_summary import build_trial_summaries
 from validator import (
     apply_missing_policy,
     normalize_llm_batch_result,
@@ -49,6 +50,8 @@ RESULT_FIELDS = [
     "标准内容",
     "患者编号",
     "标注结果",
+    "最新病历记录时间",
+    "时间锚点来源",
     "匹配解释",
     "参考原始病历信息",
     "证据来源",
@@ -538,6 +541,8 @@ def main() -> int:
     }
     if optimized_plan_summary is not None:
         summary["optimization_plan"] = optimized_plan_summary
+    trial_summaries = build_trial_summaries(results)
+    summary["trial_summaries"] = len(trial_summaries)
     export_outputs(
         output_dir,
         results,
@@ -546,6 +551,7 @@ def main() -> int:
         write_xlsx=bool(run_cfg.get("write_xlsx", False)),
         patient_rows=patient_rows,
         failed_task_rows=failed_task_rows,
+        trial_summaries=trial_summaries,
     )
     (log_dir / f"run_{run_id}.log").write_text(
         "\n".join(
@@ -1075,7 +1081,9 @@ def label_one(client: LLMClient, template_path: Path, patient: PatientRecord, ru
     structured = None
     use_structured_judge = bool(labeling_cfg.get("use_structured_judge", True))
     if use_structured_judge and profile.needs_llm is False:
-        structured = try_structured_judge(patient, rule)
+        anchor_time = patient.time_anchor.get("screening_time")
+        reference_date = datetime.fromisoformat(anchor_time).date() if anchor_time else None
+        structured = try_structured_judge(patient, rule, reference_date)
     evidence = build_evidence(
         patient,
         rule,
@@ -1086,7 +1094,7 @@ def label_one(client: LLMClient, template_path: Path, patient: PatientRecord, ru
     if structured:
         normalized = structured
     else:
-        prompt = build_prompt(template_path, patient.patient_sn, rule, evidence)
+        prompt = build_prompt(template_path, patient.patient_sn, rule, evidence, patient.time_anchor)
         normalized = normalize_llm_result(client.label(prompt), rule)
         if bool(labeling_cfg.get("apply_missing_policy", True)):
             normalized = apply_missing_policy(normalized, rule, profile)
@@ -1115,7 +1123,7 @@ def label_batch(client: LLMClient, template_path: Path, patient: PatientRecord, 
         profiles[(rule.trial_id, rule.standard_no)] = profile
         evidences[(rule.trial_id, rule.standard_no)] = evidence
 
-    prompt = build_batch_prompt(template_path, patient.patient_sn, prepared)
+    prompt = build_batch_prompt(template_path, patient.patient_sn, prepared, patient.time_anchor)
     normalized_items = normalize_llm_batch_result(client.label(prompt), rules)
     rows = []
     for rule, normalized in zip(rules, normalized_items):
@@ -1162,6 +1170,7 @@ def label_batch_optimized(
         patient.patient_sn,
         prepared,
         use_compact_template=bool(labeling_cfg.get("use_compact_prompt", True)),
+        time_anchor=patient.time_anchor,
     )
     normalized_items = normalize_llm_batch_result_strict(client.label(prompt), rules)
     rows = []
@@ -1190,6 +1199,13 @@ def build_result_row(
         "标准内容": rule.rule_text,
         "患者编号": patient.patient_sn,
         "标注结果": normalized["label"],
+        "最新病历记录时间": patient.time_anchor.get("latest_record_time", ""),
+        "时间锚点来源": ".".join(
+            value for value in (
+                patient.time_anchor.get("latest_record_sheet", ""),
+                patient.time_anchor.get("latest_record_field", ""),
+            ) if value
+        ),
         "匹配解释": normalized["explanation"],
         "参考原始病历信息": normalized["evidence"] or evidence.text[:1200],
         "证据来源": ",".join(evidence.sources),
